@@ -13,6 +13,7 @@ from tgengine.core.batch import NeighborData, PreparedBatch, RawBatch
 from tgengine.core.temporal_graph import TemporalGraph
 from tgengine.models.base import ModelOutput, TemporalModel
 from tgengine.pipeline import DataPipeline
+from tgengine.pipeline.async_pipeline import AsyncDataPipeline
 from tgengine.pipeline.negatives import (
     HistoricalNegative,
     InductiveNegative,
@@ -29,6 +30,7 @@ class TrainConfig:
     patience: int = 10
     device: str = "cuda"
     seed: int = 42
+    async_pipeline: bool = False  # prefetch batch i+1 while computing batch i
 
 
 class EvalProtocol(ABC):
@@ -252,6 +254,11 @@ class Engine:
         self.config = config
 
         self.pipeline = DataPipeline(model.gather_spec, graph)
+        self.async_pipeline = (
+            AsyncDataPipeline(model.gather_spec, graph, neg_strategy)
+            if config.async_pipeline and config.device.startswith("cuda")
+            else None
+        )
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     def train(self) -> dict[str, float]:
@@ -283,31 +290,59 @@ class Engine:
         self.model.train()
         total_loss = 0.0
 
+        if self.async_pipeline is not None:
+            total_loss = self._train_epoch_async()
+        else:
+            total_loss = self._train_epoch_sync()
+
+        return total_loss / len(self.train_batches)
+
+    def _train_epoch_sync(self) -> float:
+        total_loss = 0.0
         for raw_batch in tqdm(self.train_batches, desc="Training"):
-            # Sample negatives
             neg = self.neg_strategy.sample(
                 raw_batch.src, raw_batch.dst, raw_batch.time, self.graph
             )
             raw_batch.neg = neg
-
-            # Pipeline: prepare all data in one fused pass
             prepared = self.pipeline.prepare(raw_batch)
-
-            # Forward
             self.optimizer.zero_grad()
             output = self.model(prepared)
             output.loss.backward()
             self.optimizer.step()
+            total_loss += output.loss.item()
+            self.graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+            self.model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+        return total_loss
 
+    def _train_epoch_async(self) -> float:
+        """Training loop with double-buffered async prefetch."""
+        pipe = self.async_pipeline
+        batches = self.train_batches
+        total_loss = 0.0
+
+        if not batches:
+            return 0.0
+
+        # Prime: prefetch first batch (graph is empty, no advance needed yet)
+        pipe.start_prefetch(batches[0])
+
+        for i in tqdm(range(len(batches)), desc="Training (async)"):
+            rb, prepared = pipe.get()
+
+            self.optimizer.zero_grad()
+            output = self.model(prepared)
+            output.loss.backward()
+            self.optimizer.step()
             total_loss += output.loss.item()
 
-            # Graph evolves: new edges become visible
-            self.graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+            # Graph and model state advance — MUST happen before next prefetch
+            self.graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
+            self.model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
 
-            # Stateful model update
-            self.model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+            if i + 1 < len(batches):
+                pipe.start_prefetch(batches[i + 1])
 
-        return total_loss / len(self.train_batches)
+        return total_loss
 
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
         """Run evaluation with proper snapshot/restore."""

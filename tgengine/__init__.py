@@ -7,6 +7,7 @@ from .core.dataset import TemporalDataset, load_dataset
 from .core.gather_spec import GatherSpec, NeighborSpec
 from .core.temporal_graph import TemporalGraph
 from .engine import APEval, Engine, EvalProtocol, MRREval, ThreeWayEval, TrainConfig
+from .pipeline.async_pipeline import AsyncDataPipeline
 from .models.base import ModelOutput, TemporalModel
 from .models.dygformer import DyGFormer
 from .models.dygmamba import DyGMamba
@@ -42,6 +43,7 @@ __all__ = [
     "TemporalModel",
     # engine
     "APEval",
+    "AsyncDataPipeline",
     "Engine",
     "EvalProtocol",
     "MRREval",

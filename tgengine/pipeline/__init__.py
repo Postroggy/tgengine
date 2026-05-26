@@ -177,3 +177,7 @@ class DataPipeline:
         eq = src_ids.unsqueeze(2) == dst_ids.unsqueeze(1)           # (B, k, k)
         valid = src_nbrs.mask.unsqueeze(2) & dst_nbrs.mask.unsqueeze(1)
         return (eq & valid).any(dim=2).float().sum(dim=1)            # (B,)
+
+
+# Import after DataPipeline is defined to avoid circular import
+from tgengine.pipeline.async_pipeline import AsyncDataPipeline  # noqa: E402
