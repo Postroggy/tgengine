@@ -60,55 +60,66 @@ class TemporalGraph:
     def recent(self, nodes: Tensor, times: Tensor, k: int) -> NeighborData:
         """Get most recent k neighbors for each node before the query time.
 
-        This is the primary data access operation. Batch-vectorized.
+        O(NB) — no Python loops. Uses amax-based window selection:
+          1. Unroll ring buffer to chronological order.
+          2. Find last valid position via amax.
+          3. Slice a k-window ending there.
 
         Args:
             nodes: (N,) node IDs to query.
-            times: (N,) query timestamps. Only neighbors with t < query_time are returned.
-            k: number of recent neighbors to return.
+            times: (N,) query timestamps — only neighbors with t < query_time returned.
+            k: number of recent neighbors to return (most-recent-last in output).
 
         Returns:
-            NeighborData with shape (N, k, ...).
+            NeighborData with tensors of shape (N, k).
         """
         N = nodes.shape[0]
         B = self.buffer_size
 
-        # Read the ring buffers for queried nodes
-        nbr_ids = self._neighbor_ids[nodes]  # (N, B)
+        # Read ring buffers for queried nodes
+        nbr_ids = self._neighbor_ids[nodes]   # (N, B)
         nbr_times = self._neighbor_times[nodes]  # (N, B)
         nbr_feats = self._neighbor_feats[nodes]  # (N, B, d)
-        write_pos = self._write_pos[nodes]  # (N,)
+        write_pos = self._write_pos[nodes]       # (N,)
 
-        # Unroll ring buffer: map to chronological order (oldest → newest)
-        offsets = torch.arange(B, device=self.device).unsqueeze(0)  # (1, B)
-        chronological_idx = (write_pos.unsqueeze(1) - B + offsets) % B  # (N, B)
+        # Unroll to chronological order: oldest entry at col 0, newest at col B-1
+        offsets = torch.arange(B, device=self.device).unsqueeze(0)          # (1, B)
+        chrono_idx = (write_pos.unsqueeze(1) - B + offsets) % B             # (N, B)
 
-        # Gather in chronological order
-        sorted_ids = torch.gather(nbr_ids, 1, chronological_idx)
-        sorted_times = torch.gather(nbr_times, 1, chronological_idx)
+        sorted_ids = torch.gather(nbr_ids, 1, chrono_idx)                   # (N, B)
+        sorted_times = torch.gather(nbr_times, 1, chrono_idx)               # (N, B)
         sorted_feats = torch.gather(
-            nbr_feats, 1, chronological_idx.unsqueeze(-1).expand(-1, -1, self.edge_feat_dim)
+            nbr_feats, 1, chrono_idx.unsqueeze(-1).expand(-1, -1, self.edge_feat_dim)
+        )  # (N, B, d)
+
+        # Validity mask: strictly before query time and not padding
+        valid = (sorted_times < times.unsqueeze(1)) & (sorted_ids != self.PADDING_ID)  # (N, B)
+
+        # Find rightmost valid position per node — O(NB) via amax
+        col_pos = torch.arange(B, device=self.device, dtype=torch.int64)    # (B,)
+        last_valid = torch.where(
+            valid.any(dim=1),
+            (valid.long() * col_pos).amax(dim=1),                           # (N,)
+            torch.full((N,), -1, dtype=torch.int64, device=self.device),
         )
 
-        # Time mask: only keep neighbors strictly before query time
-        time_mask = (sorted_times < times.unsqueeze(1)) & (sorted_ids != self.PADDING_ID)
+        # Build k-window: [last_valid-k+1 ... last_valid], clamped to -1 for out-of-range
+        window = last_valid.unsqueeze(1) - torch.arange(k - 1, -1, -1, device=self.device)  # (N, k)
+        window = window.clamp(min=-1)   # (N, k) — -1 means no valid entry
+        out_mask = window >= 0          # (N, k)
+        safe = window.clamp(min=0)      # safe indices for gather
 
-        # For each node, take the last k valid entries (most recent)
-        # We reverse so that most recent is first, then take top-k
-        reversed_ids = sorted_ids.flip(1)
-        reversed_times = sorted_times.flip(1)
-        reversed_feats = sorted_feats.flip(1)
-        reversed_mask = time_mask.flip(1)
+        out_ids = torch.gather(sorted_ids, 1, safe)     # (N, k)
+        out_times = torch.gather(sorted_times, 1, safe) # (N, k)
+        out_feats = torch.gather(sorted_feats, 1, safe.unsqueeze(-1).expand(-1, -1, self.edge_feat_dim))  # (N,k,d)
 
-        # Vectorized compaction: assign positional score; invalid entries pushed past k
-        pos = torch.arange(B, device=self.device).unsqueeze(0).expand(N, -1)  # (N, B)
-        scores = torch.where(reversed_mask, pos, torch.full((N, B), B, dtype=pos.dtype, device=self.device))
-        topk_idx = scores.argsort(dim=1, stable=True)[:, :k]  # (N, k)
+        # Valid if: window index is in range AND content is not padding
+        out_mask = (window >= 0) & (out_ids != self.PADDING_ID)
 
-        out_ids = torch.gather(reversed_ids, 1, topk_idx)
-        out_times = torch.gather(reversed_times, 1, topk_idx)
-        out_feats = torch.gather(reversed_feats, 1, topk_idx.unsqueeze(-1).expand(-1, -1, self.edge_feat_dim))
-        out_mask = torch.gather(reversed_mask, 1, topk_idx)
+        # Zero-fill slots that are not valid
+        out_ids = out_ids.masked_fill(~out_mask, self.PADDING_ID)
+        out_times = out_times.masked_fill(~out_mask, 0.0)
+        out_feats = out_feats.masked_fill(~out_mask.unsqueeze(-1), 0.0)
 
         return NeighborData(
             neighbor_ids=out_ids,
@@ -139,14 +150,15 @@ class TemporalGraph:
         src_mask = all_nbrs.mask[:B]          # (B, k)
         dst_mask = all_nbrs.mask[B:]          # (B, k)
 
-        # (B, k_src, k_dst): for each pair, which src neighbors appear in dst neighbors
-        eq = src_ids.unsqueeze(2) == dst_ids.unsqueeze(1)
-        valid = src_mask.unsqueeze(2) & dst_mask.unsqueeze(1)
         # Count unique src neighbors that appear anywhere in dst's neighborhood
-        return (eq & valid).any(dim=2).float().sum(dim=1)  # (B,)
+        eq = src_ids.unsqueeze(2) == dst_ids.unsqueeze(1)   # (B, k, k)
+        valid = src_mask.unsqueeze(2) & dst_mask.unsqueeze(1)
+        return (eq & valid).any(dim=2).float().sum(dim=1)    # (B,)
 
     def advance(self, src: Tensor, dst: Tensor, time: Tensor, edge_feat: Optional[Tensor] = None):
-        """Append new edges to the graph. Updates ring buffers for both src and dst.
+        """Append new edges to the graph (undirected). Updates ring buffers for both endpoints.
+
+        Handles duplicate src/dst nodes within the same batch correctly.
 
         Args:
             src: (B,) source nodes.
@@ -158,19 +170,56 @@ class TemporalGraph:
         if edge_feat is None:
             edge_feat = torch.zeros((B, self.edge_feat_dim), device=self.device)
 
-        # Update src → dst direction
         self._append_edges(src, dst, time, edge_feat)
-        # Update dst → src direction (undirected)
         self._append_edges(dst, src, time, edge_feat)
         self._num_edges += B
 
     def _append_edges(self, from_nodes: Tensor, to_nodes: Tensor, time: Tensor, feat: Tensor):
-        """Append directed edges to ring buffers."""
-        write_idx = self._write_pos[from_nodes] % self.buffer_size
-        self._neighbor_ids[from_nodes, write_idx] = to_nodes.to(torch.int32)
-        self._neighbor_times[from_nodes, write_idx] = time.to(torch.float64)
-        self._neighbor_feats[from_nodes, write_idx] = feat
-        self._write_pos[from_nodes] += 1
+        """Append directed edges to ring buffers.
+
+        Handles duplicate from_nodes by sorting and computing per-event write offsets,
+        matching TGM's approach for correctness with repeated nodes in a batch.
+        """
+        device = self.device
+        n = from_nodes.shape[0]
+        B = self.buffer_size
+
+        # Sort by (node, time) so duplicate nodes are grouped chronologically
+        sort_key = from_nodes.long() * (time.long().max() + 1) + time.long()
+        perm = sort_key.argsort(stable=True)
+
+        s_from = from_nodes[perm]
+        s_to = to_nodes[perm]
+        s_time = time[perm]
+        s_feat = feat[perm]
+
+        # Compute per-event position within each node's group
+        _, inv, cnts = torch.unique_consecutive(s_from.long(), return_inverse=True, return_counts=True)
+        group_start = torch.cat([torch.zeros(1, dtype=torch.int64, device=device), cnts.cumsum(0)[:-1]])
+        event_offset = torch.arange(n, device=device) - group_start[inv]  # (n,)
+
+        # Keep at most last B events per node (earlier events fall off the ring buffer anyway)
+        keep = event_offset >= (cnts[inv] - B)
+        s_from = s_from[keep]
+        s_to = s_to[keep]
+        s_time = s_time[keep]
+        s_feat = s_feat[keep]
+
+        # Recompute fresh 0-based offsets within the kept events for each node
+        n_kept = s_from.shape[0]
+        _, inv2, cnts2 = torch.unique_consecutive(s_from.long(), return_inverse=True, return_counts=True)
+        gs2 = torch.cat([torch.zeros(1, dtype=torch.int64, device=device), cnts2.cumsum(0)[:-1]])
+        kept_offset = torch.arange(n_kept, device=device) - gs2[inv2]  # (n_kept,) 0,1,2...
+
+        write_idx = (self._write_pos[s_from] + kept_offset) % B
+
+        self._neighbor_ids[s_from, write_idx] = s_to.to(torch.int32)
+        self._neighbor_times[s_from, write_idx] = s_time.to(torch.float64)
+        self._neighbor_feats[s_from, write_idx] = s_feat
+
+        # Increment write_pos by number of actual writes per node
+        ones = torch.ones(n_kept, dtype=torch.int64, device=device)
+        self._write_pos.scatter_add_(0, s_from.long(), ones)
 
     def snapshot(self) -> Snapshot:
         """Create a lightweight snapshot for eval restore."""
@@ -202,8 +251,6 @@ class TemporalGraph:
         """Construct a TemporalGraph by replaying all events."""
         d_edge = edge_feat.shape[1] if edge_feat is not None else 172
         graph = cls(num_nodes, buffer_size, d_edge, device)
-        # Replay in chronological order (data assumed sorted by time)
-        # Process in large chunks for efficiency
         chunk_size = 10000
         n = src.shape[0]
         for start in range(0, n, chunk_size):

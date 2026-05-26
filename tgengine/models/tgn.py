@@ -19,7 +19,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from tgengine import GatherSpec, ModelOutput, NeighborSpec, PreparedBatch, TemporalModel
+from tgengine.core.batch import PreparedBatch
+from tgengine.core.gather_spec import GatherSpec, NeighborSpec
+from tgengine.models.base import ModelOutput, TemporalModel
 from tgengine.core.batch import NeighborData
 from tgengine.nn import BilinearDecoder, GRUSeqEncoder, Time2Vec
 from tgengine.nn.memory import NodeMemory

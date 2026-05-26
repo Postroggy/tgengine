@@ -107,3 +107,38 @@ tgengine/
 - 优先 vectorized PyTorch 操作，禁止 hot path 里出现 Python for loop
 - 新增模块必须有对应 test
 - 不引入 Lightning / Hydra 等重依赖
+
+## 性能优化的正确性原则
+
+**做性能优化时，必须保证 input→output 语义不变，否则不是优化，是换了个算法。**
+
+教训来源（2026-05）：实现 `HistoricalNegative` 时，为了利用已有的 k=32 ring buffer
+直接从最近 32 个邻居里采负样本，比 DyGLib/TGM 快数倍。但 DyGLib/TGM 的语义是
+"从 src **所有历史**交互中随机采样"，我们的语义是"从 src **最近 k 个**中采"。
+两者 given same input，output distribution 根本不同。benchmark 因此无效——
+我们做了更少的工作，拿更快的速度对比做更多工作的基线，结论没有意义。
+
+**规则：**
+1. 优化前，先写出目标算法的精确 input/output 规范（用例子说明）。
+2. 优化后，验证给定相同 input，优化版与参考版产出相同 output（允许随机性则验证分布等价）。
+3. 若做了近似（bounded pool 代替 full history），必须明确命名区分（如 `RecentHistoricalNegative`），
+   并在 benchmark 注释里说明与基线的语义差异。
+4. 不允许以"近似更快"为由在 benchmark 中直接对比语义不同的算法。
+
+## 测试环境
+
+代码测试在远程服务器 `scnu` 上执行：
+
+```bash
+# 同步本地改动到远程
+rsync -av --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' --exclude='*.egg-info' \
+    /Users/xg/Coding/PersonalFile/tgengine/ scnu:~/CodeBase/Graph/tgengine/
+
+# 在远程运行测试（conda 环境 PyGBase，PyTorch 2.10+cu128，有 GPU）
+ssh scnu 'bash -l -c "cd ~/CodeBase/Graph/tgengine && conda run -n PyGBase python -m pytest tests/ -v 2>&1"'
+```
+
+- 远程项目路径：`~/CodeBase/Graph/tgengine/`
+- 数据集路径：`/mnt/home/gyq/CodeBase/Graph/DG_Data`
+- conda 环境：`PyGBase`（PyTorch 2.10.0+cu128，CUDA 可用）
+- 首次部署需 `conda run -n PyGBase pip install -e .`

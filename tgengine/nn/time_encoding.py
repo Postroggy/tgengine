@@ -29,9 +29,8 @@ class Time2Vec(nn.Module):
         """
         dt = dt.unsqueeze(-1).float()  # (..., 1)
         out = self.w(dt)  # (..., d_model)
-        # First dimension is linear, rest are sinusoidal
-        out[..., 1:] = torch.sin(out[..., 1:])
-        return out
+        # First dimension is linear, rest are sinusoidal — use cat to avoid inplace
+        return torch.cat([out[..., :1], torch.sin(out[..., 1:])], dim=-1)
 
 
 class HarmonicEncoder(nn.Module):

@@ -14,6 +14,7 @@ from .models.tgn import TGN
 from .pipeline.negatives import (
     FixedNegative,
     HistoricalNegative,
+    HistoricalNegPool,
     InductiveNegative,
     NegativeStrategy,
     RandomNegative,
@@ -45,6 +46,7 @@ __all__ = [
     # negatives
     "FixedNegative",
     "HistoricalNegative",
+    "HistoricalNegPool",
     "InductiveNegative",
     "NegativeStrategy",
     "RandomNegative",

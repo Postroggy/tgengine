@@ -49,8 +49,10 @@ def test_recent_time_filter():
     # Query at time 6.0 — should only see neighbors at t=1.0 and t=5.0
     result = graph.recent(torch.tensor([0]), torch.tensor([6.0], dtype=torch.float64), k=3)
     assert result.mask.sum() == 2
-    # Most recent valid neighbor is at t=5.0 (node 2)
-    assert result.neighbor_ids[0, 0].item() == 2
+    # Most-recent-last ordering: node 2 (t=5.0) is at index k-1=2, node 1 at index 1
+    assert result.neighbor_ids[0, 2].item() == 2
+    assert result.neighbor_ids[0, 1].item() == 1
+    assert result.neighbor_ids[0, 0].item() == -1  # padding
 
 
 def test_co_neighbors():
@@ -152,7 +154,7 @@ def test_dygformer_forward():
             torch.ones(B, K, dtype=torch.bool),
         )
 
-    model = DyGFormer(d_model=d, d_edge=d, n_layers=1, n_heads=2)
+    model = DyGFormer(d_model=d, d_edge=d, K=K, d_time=8, d_channel=8, n_layers=1, n_heads=2)
     batch = __import__('tgengine').PreparedBatch(
         src=torch.arange(B),
         dst=torch.arange(B) + B,

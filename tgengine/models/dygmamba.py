@@ -9,7 +9,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tgengine import GatherSpec, ModelOutput, NeighborSpec, PreparedBatch, TemporalModel
+from tgengine.core.batch import PreparedBatch
+from tgengine.core.gather_spec import GatherSpec, NeighborSpec
+from tgengine.models.base import ModelOutput, TemporalModel
 from tgengine.nn import BilinearDecoder, MambaSeqEncoder, Time2Vec
 
 
