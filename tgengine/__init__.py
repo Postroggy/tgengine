@@ -10,6 +10,8 @@ from .engine import APEval, Engine, EvalProtocol, MRREval, ThreeWayEval, TrainCo
 from .models.base import ModelOutput, TemporalModel
 from .models.dygformer import DyGFormer
 from .models.dygmamba import DyGMamba
+from .models.freedyg import FreeDyG
+from .models.graphmixer import GraphMixer
 from .models.tgn import TGN
 from .pipeline.negatives import (
     FixedNegative,
@@ -33,6 +35,8 @@ __all__ = [
     # models
     "DyGFormer",
     "DyGMamba",
+    "FreeDyG",
+    "GraphMixer",
     "ModelOutput",
     "TGN",
     "TemporalModel",

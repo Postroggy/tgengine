@@ -314,8 +314,18 @@ class Engine:
         graph_snap = self.graph.snapshot()
         model_state = self.model.freeze()
 
+        # Ensure every eval batch has negatives sampled (use train neg strategy)
+        prepped = []
+        for rb in eval_batches:
+            if rb.neg is None:
+                neg = self.neg_strategy.sample(rb.src, rb.dst, rb.time, self.graph)
+                rb = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
+                              edge_feat=rb.edge_feat, neg=neg,
+                              edge_indices=rb.edge_indices)
+            prepped.append(rb)
+
         metrics = self.eval_protocol.evaluate(
-            self.model, self.pipeline, eval_batches, self.graph
+            self.model, self.pipeline, prepped, self.graph
         )
 
         self.graph.restore(graph_snap)
