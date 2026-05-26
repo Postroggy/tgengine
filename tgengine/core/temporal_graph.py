@@ -100,26 +100,15 @@ class TemporalGraph:
         reversed_feats = sorted_feats.flip(1)
         reversed_mask = time_mask.flip(1)
 
-        # Sort valid entries to front using mask
-        # Approach: compute cumulative valid count, use it as scatter index
-        valid_count = reversed_mask.cumsum(dim=1)
-        # Take first k positions
-        out_ids = torch.full((N, k), self.PADDING_ID, dtype=torch.int32, device=self.device)
-        out_times = torch.zeros((N, k), dtype=torch.float64, device=self.device)
-        out_feats = torch.zeros((N, k, self.edge_feat_dim), dtype=torch.float32, device=self.device)
-        out_mask = torch.zeros((N, k), dtype=torch.bool, device=self.device)
+        # Vectorized compaction: assign positional score; invalid entries pushed past k
+        pos = torch.arange(B, device=self.device).unsqueeze(0).expand(N, -1)  # (N, B)
+        scores = torch.where(reversed_mask, pos, torch.full((N, B), B, dtype=pos.dtype, device=self.device))
+        topk_idx = scores.argsort(dim=1, stable=True)[:, :k]  # (N, k)
 
-        # Compact valid entries to the left
-        for i in range(min(k, B)):
-            col_mask = reversed_mask[:, i] & (valid_count[:, i] <= k)
-            target_col = valid_count[:, i] - 1  # 0-indexed position
-            valid_rows = col_mask & (target_col < k)
-            if valid_rows.any():
-                target_idx = target_col[valid_rows]
-                out_ids[valid_rows, target_idx] = reversed_ids[valid_rows, i]
-                out_times[valid_rows, target_idx] = reversed_times[valid_rows, i]
-                out_feats[valid_rows, target_idx] = reversed_feats[valid_rows, i]
-                out_mask[valid_rows, target_idx] = True
+        out_ids = torch.gather(reversed_ids, 1, topk_idx)
+        out_times = torch.gather(reversed_times, 1, topk_idx)
+        out_feats = torch.gather(reversed_feats, 1, topk_idx.unsqueeze(-1).expand(-1, -1, self.edge_feat_dim))
+        out_mask = torch.gather(reversed_mask, 1, topk_idx)
 
         return NeighborData(
             neighbor_ids=out_ids,
@@ -128,7 +117,7 @@ class TemporalGraph:
             mask=out_mask,
         )
 
-    def co_neighbors(self, src: Tensor, dst: Tensor, times: Tensor) -> Tensor:
+    def co_neighbors(self, src: Tensor, dst: Tensor, times: Tensor, k: int = 32) -> Tensor:
         """Compute co-occurrence counts between src and dst neighbor sets.
 
         For each (src_i, dst_i) pair, count how many neighbors they share.
@@ -137,12 +126,24 @@ class TemporalGraph:
             src: (B,) source node IDs.
             dst: (B,) destination node IDs.
             times: (B,) query timestamps.
+            k: number of recent neighbors to sample per node.
 
         Returns:
-            Tensor (B,) co-occurrence counts.
+            Tensor (B,) float co-occurrence counts.
         """
-        # TODO: implement efficient vectorized co-neighbor counting
-        raise NotImplementedError("co_neighbors not yet implemented")
+        B = src.shape[0]
+        # Fused query: sample neighbors for all src and dst in one call
+        all_nbrs = self.recent(torch.cat([src, dst]), torch.cat([times, times]), k)
+        src_ids = all_nbrs.neighbor_ids[:B]   # (B, k) int32
+        dst_ids = all_nbrs.neighbor_ids[B:]   # (B, k) int32
+        src_mask = all_nbrs.mask[:B]          # (B, k)
+        dst_mask = all_nbrs.mask[B:]          # (B, k)
+
+        # (B, k_src, k_dst): for each pair, which src neighbors appear in dst neighbors
+        eq = src_ids.unsqueeze(2) == dst_ids.unsqueeze(1)
+        valid = src_mask.unsqueeze(2) & dst_mask.unsqueeze(1)
+        # Count unique src neighbors that appear anywhere in dst's neighborhood
+        return (eq & valid).any(dim=2).float().sum(dim=1)  # (B,)
 
     def advance(self, src: Tensor, dst: Tensor, time: Tensor, edge_feat: Optional[Tensor] = None):
         """Append new edges to the graph. Updates ring buffers for both src and dst.

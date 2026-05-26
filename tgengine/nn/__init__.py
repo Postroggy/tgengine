@@ -1,13 +1,14 @@
-from .time_encoding import Time2Vec, HarmonicEncoder
+from .co_neighbor import CoNeighborEncoder
+from .decoder import BilinearDecoder, ConcatMLPDecoder, MergeDecoder
+from .memory import NodeMemory
 from .seq_encoder import (
+    GRUSeqEncoder,
+    MambaSeqEncoder,
+    MeanPoolEncoder,
     SequenceEncoder,
     TransformerSeqEncoder,
-    MambaSeqEncoder,
-    GRUSeqEncoder,
-    MeanPoolEncoder,
 )
-from .decoder import BilinearDecoder, MergeDecoder, ConcatMLPDecoder
-from .co_neighbor import CoNeighborEncoder
+from .time_encoding import HarmonicEncoder, Time2Vec
 
 __all__ = [
     "BilinearDecoder",
@@ -18,6 +19,7 @@ __all__ = [
     "MambaSeqEncoder",
     "MeanPoolEncoder",
     "MergeDecoder",
+    "NodeMemory",
     "SequenceEncoder",
     "Time2Vec",
     "TransformerSeqEncoder",

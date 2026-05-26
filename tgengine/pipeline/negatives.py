@@ -58,6 +58,26 @@ class HistoricalNegative(NegativeStrategy):
         return neg
 
 
+class InductiveNegative(NegativeStrategy):
+    """Sample negatives from nodes never seen in training (inductive split).
+
+    Nodes are those that have total degree zero in the training graph — i.e.,
+    they never appeared as src or dst in the training period.
+    """
+
+    def __init__(self, inductive_nodes: Tensor):
+        """
+        Args:
+            inductive_nodes: 1-D tensor of node IDs unseen during training.
+        """
+        self.inductive_nodes = inductive_nodes
+
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
+        n = src.shape[0]
+        rand_idx = torch.randint(0, len(self.inductive_nodes), (n,), device=src.device)
+        return self.inductive_nodes.to(src.device)[rand_idx]
+
+
 class FixedNegative(NegativeStrategy):
     """Fixed negative lists (for TGB evaluation)."""
 

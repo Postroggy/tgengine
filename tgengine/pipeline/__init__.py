@@ -84,7 +84,7 @@ class DataPipeline:
         # Co-occurrence (optional)
         co_occur = None
         if self.spec.co_occurrence:
-            co_occur = self.graph.co_neighbors(raw_batch.src, raw_batch.dst, raw_batch.time)
+            co_occur = self.graph.co_neighbors(raw_batch.src, raw_batch.dst, raw_batch.time, k=k)
 
         return PreparedBatch(
             src=raw_batch.src,

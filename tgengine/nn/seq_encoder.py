@@ -71,8 +71,8 @@ class MambaSeqEncoder(SequenceEncoder):
         self.rnn = nn.GRU(d_model, d_model, num_layers=n_layers, batch_first=True)
 
     def forward(self, seq: Tensor, mask: Tensor) -> Tensor:
-        # Pack padded sequence for efficiency
-        lengths = mask.sum(dim=1).cpu()
+        # Clamp to 1 so pack_padded_sequence never sees zero-length sequences
+        lengths = mask.sum(dim=1).cpu().clamp(min=1)
         packed = nn.utils.rnn.pack_padded_sequence(
             seq, lengths, batch_first=True, enforce_sorted=False
         )
@@ -89,7 +89,7 @@ class GRUSeqEncoder(SequenceEncoder):
         self.rnn = nn.GRU(d_model, d_model, num_layers=n_layers, batch_first=True)
 
     def forward(self, seq: Tensor, mask: Tensor) -> Tensor:
-        lengths = mask.sum(dim=1).cpu()
+        lengths = mask.sum(dim=1).cpu().clamp(min=1)
         packed = nn.utils.rnn.pack_padded_sequence(
             seq, lengths, batch_first=True, enforce_sorted=False
         )
