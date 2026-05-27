@@ -100,7 +100,8 @@ class ThreeWayEval(EvalProtocol):
 
             with torch.no_grad():
                 for raw_batch in eval_batches:
-                    neg = strategy.sample(raw_batch.src, raw_batch.dst, raw_batch.time, graph)
+                    neg = strategy.sample(raw_batch.src, raw_batch.dst, raw_batch.time, graph,
+                                         raw_batch.edge_indices)
                     batch = RawBatch(
                         src=raw_batch.src,
                         dst=raw_batch.dst,
@@ -301,7 +302,8 @@ class Engine:
         total_loss = 0.0
         for raw_batch in tqdm(self.train_batches, desc="Training"):
             neg = self.neg_strategy.sample(
-                raw_batch.src, raw_batch.dst, raw_batch.time, self.graph
+                raw_batch.src, raw_batch.dst, raw_batch.time, self.graph,
+                raw_batch.edge_indices,
             )
             raw_batch.neg = neg
             prepared = self.pipeline.prepare(raw_batch)
@@ -353,7 +355,8 @@ class Engine:
         prepped = []
         for rb in eval_batches:
             if rb.neg is None:
-                neg = self.neg_strategy.sample(rb.src, rb.dst, rb.time, self.graph)
+                neg = self.neg_strategy.sample(rb.src, rb.dst, rb.time, self.graph,
+                                                rb.edge_indices)
                 rb = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
                               edge_feat=rb.edge_feat, neg=neg,
                               edge_indices=rb.edge_indices)

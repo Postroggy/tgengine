@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from tgengine.pipeline.negatives import HistoricalNegPool, HistoricalNegative
+from tgengine.pipeline.negatives import FixedNegative, HistoricalNegPool, HistoricalNegative
 from tgengine.core.temporal_graph import TemporalGraph
 from tgengine.core.batch import RawBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
@@ -254,5 +254,34 @@ def test_historical_negative_covers_beyond_ring_buffer():
         f"HistoricalNegative should sample from full history but none of the "
         f"old neighbors {sorted(old_neighbors)[:5]}... appeared in {n_trials} trials"
     )
+
+
+# ---------------------------------------------------------------------------
+# FixedNegative (TGB-style fixed neg lists)
+# ---------------------------------------------------------------------------
+
+def test_fixed_negative_lookup():
+    """FixedNegative.sample() returns correct rows from neg_lists via edge_indices."""
+    neg_lists = torch.arange(100).reshape(10, 10)  # 10 edges, 10 negs each
+    strategy = FixedNegative(neg_lists)
+
+    # Sample edge 0, 3, 7
+    edge_indices = torch.tensor([0, 3, 7])
+    neg = strategy.sample(
+        torch.zeros(3), torch.zeros(3), torch.zeros(3), graph=None,
+        edge_indices=edge_indices,
+    )
+    assert neg.shape == (3, 10)
+    assert torch.equal(neg[0], neg_lists[0])  # edge 0 → row 0
+    assert torch.equal(neg[1], neg_lists[3])  # edge 3 → row 3
+    assert torch.equal(neg[2], neg_lists[7])  # edge 7 → row 7
+
+
+def test_fixed_negative_requires_edge_indices():
+    """FixedNegative.sample() raises ValueError when edge_indices is None."""
+    neg_lists = torch.arange(100).reshape(10, 10)
+    strategy = FixedNegative(neg_lists)
+    with pytest.raises(ValueError, match="edge_indices"):
+        strategy.sample(torch.zeros(3), torch.zeros(3), torch.zeros(3), graph=None)
 
 

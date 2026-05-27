@@ -101,7 +101,8 @@ class AsyncDataPipeline:
             try:
                 with torch.cuda.stream(prefetch_stream):
                     neg = neg_strat.sample(
-                        raw_batch.src, raw_batch.dst, raw_batch.time, pipeline.graph
+                        raw_batch.src, raw_batch.dst, raw_batch.time, pipeline.graph,
+                        raw_batch.edge_indices,
                     )
                     rb = RawBatch(
                         src=raw_batch.src, dst=raw_batch.dst, time=raw_batch.time,

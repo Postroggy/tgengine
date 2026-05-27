@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -128,7 +129,8 @@ class NegativeStrategy(ABC):
     """Base class for negative sampling strategies."""
 
     @abstractmethod
-    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
         """Sample negative destination nodes.
 
         Args:
@@ -136,6 +138,7 @@ class NegativeStrategy(ABC):
             dst: (B,) positive destination nodes.
             time: (B,) timestamps.
             graph: the temporal graph (for historical neg).
+            edge_indices: (B,) global edge indices (for TGB fixed neg lookup).
 
         Returns:
             Tensor of shape (B,) or (B, N_neg) negative node IDs.
@@ -152,7 +155,8 @@ class RandomNegative(NegativeStrategy):
     def __init__(self, num_nodes: int):
         self.num_nodes = num_nodes
 
-    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
         return torch.randint(0, self.num_nodes, (src.shape[0],), device=src.device)
 
 
@@ -183,7 +187,8 @@ class HistoricalNegative(NegativeStrategy):
         """Ingest new edges into the reservoir pool. Call alongside graph.advance()."""
         self._pool.update(src, dst)
 
-    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
         return self._pool.sample(src)
 
 
@@ -196,17 +201,27 @@ class InductiveNegative(NegativeStrategy):
     def __init__(self, inductive_nodes: Tensor):
         self.inductive_nodes = inductive_nodes
 
-    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
         n = src.shape[0]
         rand_idx = torch.randint(0, len(self.inductive_nodes), (n,), device=src.device)
         return self.inductive_nodes.to(src.device)[rand_idx]
 
 
 class FixedNegative(NegativeStrategy):
-    """Fixed negative lists (for TGB evaluation)."""
+    """Fixed negative lists (for TGB evaluation).
+
+    neg_lists: (N_total, N_neg) pre-defined negative node IDs.
+    Each row corresponds to a global edge index. Uses edge_indices
+    from RawBatch to look up the correct negative candidates.
+    """
 
     def __init__(self, neg_lists: Tensor):
         self.neg_lists = neg_lists
 
-    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
-        raise NotImplementedError("FixedNegative requires edge_indices in RawBatch")
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
+        if edge_indices is None:
+            raise ValueError("FixedNegative requires edge_indices in RawBatch")
+        neg = self.neg_lists[edge_indices.long()]  # (B, N_neg)
+        return neg.to(src.device)
