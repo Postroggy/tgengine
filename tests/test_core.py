@@ -241,6 +241,118 @@ def test_pipeline_fused_query():
     assert prepared.neg_neighbors.neighbor_ids.shape == (3, 4)
 
 
+# ---------------------------------------------------------------------------
+# 2-hop neighbor sampling
+# ---------------------------------------------------------------------------
+
+
+def _build_two_hop_graph():
+    """Build a graph with known 2-hop structure.
+
+    Node 0 → Node 1 (t=1) → Node 10 (t=0.5)
+    Node 0 → Node 2 (t=2) → Node 11 (t=1.5)
+    Node 3 → Node 4 (t=3) → Node 12 (t=2.5)
+
+    Each src has exactly 1 1-hop neighbor, and each 1-hop neighbor has 1 friend.
+    """
+    device = "cpu"
+    graph = TemporalGraph(num_nodes=20, buffer_size=8, edge_feat_dim=2, device=device)
+    graph.advance(
+        torch.tensor([1, 10, 2, 11, 4, 12]),
+        torch.tensor([10, 1, 11, 2, 12, 4]),
+        torch.tensor([0.5, 0.5, 1.0, 1.0, 2.0, 2.0], dtype=torch.float64),
+        torch.randn(6, 2),
+    )
+    # Now add the "query" edges — these happen AFTER the second-hop history
+    graph.advance(
+        torch.tensor([0, 0, 3]),
+        torch.tensor([1, 2, 4]),
+        torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64),
+        torch.randn(3, 2),
+    )
+    return graph
+
+
+def test_2hop_basic():
+    """recent_2hop returns 1-hop and 2-hop neighbors with correct shapes."""
+    graph = _build_two_hop_graph()
+
+    result = graph.recent_2hop(
+        torch.tensor([0, 3]),
+        torch.tensor([10.0, 10.0], dtype=torch.float64),
+        k1=4, k2=4,
+    )
+
+    assert result.neighbor_ids.shape == (2, 4)
+    assert result.hop2_ids.shape == (2, 4, 4)
+    assert result.hop2_mask.shape == (2, 4, 4)
+    assert result.hop2_feats.shape == (2, 4, 4, 2)
+
+
+def test_2hop_temporal_causality():
+    """2-hop neighbors must have timestamps before the 1-hop interaction time."""
+    graph = _build_two_hop_graph()
+
+    result = graph.recent_2hop(
+        torch.tensor([0]),
+        torch.tensor([10.0], dtype=torch.float64),
+        k1=4, k2=4,
+    )
+
+    # Node 0's 1-hop neighbor at position with t=2.0 is node 2
+    # Node 2's only valid 2-hop neighbor should be node 11 (interaction at t=1.0 < t=2.0)
+    for i in range(4):
+        if result.mask[0, i]:
+            hop1_time = result.timestamps[0, i].item()
+            for j in range(4):
+                if result.hop2_mask[0, i, j]:
+                    hop2_time = result.hop2_times[0, i, j].item()
+                    assert hop2_time < hop1_time, \
+                        f"2-hop time {hop2_time} >= 1-hop time {hop1_time}"
+
+
+def test_2hop_padding_masked():
+    """Invalid 1-hop positions should have fully masked 2-hop."""
+    graph = _build_two_hop_graph()
+
+    result = graph.recent_2hop(
+        torch.tensor([0]),
+        torch.tensor([10.0], dtype=torch.float64),
+        k1=8, k2=4,
+    )
+
+    # Node 0 only has 2 valid 1-hop neighbors
+    valid_1hop = result.mask[0]
+    num_valid = valid_1hop.sum().item()
+    assert num_valid == 2, f"expected 2 valid 1-hop, got {num_valid}"
+
+    # Padding positions (mask=False) must have all 2-hop masked
+    padding_positions = ~valid_1hop
+    if padding_positions.any():
+        assert not result.hop2_mask[0, padding_positions].any(), \
+            "padding 1-hop positions should have all 2-hop masked"
+
+
+def test_2hop_pipeline_integration():
+    """DataPipeline with k2>0 produces NeighborData with 2-hop fields."""
+    graph = _build_two_hop_graph()
+    spec = GatherSpec(neighbors=NeighborSpec(k=4, k2=4))
+    pipeline = DataPipeline(spec, graph)
+
+    raw = RawBatch(
+        src=torch.tensor([0, 3]),
+        dst=torch.tensor([1, 4]),
+        time=torch.tensor([10.0, 10.0], dtype=torch.float64),
+        neg=torch.tensor([5, 6]),
+    )
+    prepared = pipeline.prepare(raw)
+
+    assert prepared.src_neighbors.hop2_ids is not None
+    assert prepared.src_neighbors.hop2_ids.shape == (2, 4, 4)
+    assert prepared.dst_neighbors.hop2_ids is not None
+    assert prepared.neg_neighbors.hop2_ids is not None
+
+
 if __name__ == "__main__":
     test_temporal_graph_basic()
     test_recent_time_filter()

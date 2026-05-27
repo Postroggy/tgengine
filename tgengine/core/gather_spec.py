@@ -8,10 +8,14 @@ class NeighborSpec:
     """Specification for temporal neighbor sampling."""
 
     k: int = 32
+    k2: int = 0  # 2nd-hop neighbor count; 0 disables 2-hop
     strategy: str = "recency"  # recency | uniform | time_weighted
-    hops: int = 1
     include_edge_feat: bool = True
     for_nodes: tuple[str, ...] = ("src", "dst", "neg")
+
+    @property
+    def hops(self) -> int:
+        return 2 if self.k2 > 0 else 1
 
 
 @dataclass

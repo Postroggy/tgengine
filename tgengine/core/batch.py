@@ -9,12 +9,21 @@ from torch import Tensor
 
 @dataclass
 class NeighborData:
-    """Result of a temporal neighbor query. All tensors on same device."""
+    """Result of a temporal neighbor query. All tensors on same device.
+
+    2-hop fields are populated when gather_spec.neighbors.k2 > 0:
+      hop2_ids[b, i, j] = j-th neighbor of the i-th 1-hop neighbor of source b.
+    """
 
     neighbor_ids: Tensor  # (B, K) node IDs of neighbors
     timestamps: Tensor  # (B, K) interaction timestamps
     edge_feats: Tensor  # (B, K, d_edge) edge features
     mask: Tensor  # (B, K) bool — True for valid positions, False for padding
+
+    hop2_ids: Optional[Tensor] = None      # (B, K, K2) 2-hop neighbor IDs
+    hop2_times: Optional[Tensor] = None    # (B, K, K2)
+    hop2_feats: Optional[Tensor] = None    # (B, K, K2, d_edge)
+    hop2_mask: Optional[Tensor] = None     # (B, K, K2)
 
     @property
     def batch_size(self) -> int:

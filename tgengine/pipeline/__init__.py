@@ -29,8 +29,12 @@ class DataPipeline:
         src/dst/neg are fused into a single graph.recent() call.
         Co-occurrence is computed from the already-queried src/dst neighbors
         — no redundant graph.recent() call.
+
+        When spec.neighbors.k2 > 0, 2-hop neighbors are also queried in a
+        second fused call over all valid 1-hop neighbor nodes.
         """
         k = self.spec.neighbors.k
+        k2 = self.spec.neighbors.k2
         device = raw_batch.device
 
         node_groups = []
@@ -60,24 +64,44 @@ class DataPipeline:
                 times_list.append(raw_batch.time)
         all_times = torch.cat(times_list)
 
-        all_neighbors = self.graph.recent(all_nodes, all_times, k)
+        # ---- 1-hop -------------------------------------------------------
+        if k2 > 0:
+            all_neighbors = self.graph.recent_2hop(all_nodes, all_times, k, k2)
+        else:
+            all_neighbors = self.graph.recent(all_nodes, all_times, k)
 
         splits = torch.split_with_sizes(all_neighbors.neighbor_ids, group_sizes, dim=0)
         time_splits = torch.split_with_sizes(all_neighbors.timestamps, group_sizes, dim=0)
         feat_splits = torch.split_with_sizes(all_neighbors.edge_feats, group_sizes, dim=0)
         mask_splits = torch.split_with_sizes(all_neighbors.mask, group_sizes, dim=0)
 
+        hop2_id_splits = hop2_time_splits = hop2_feat_splits = hop2_mask_splits = None
+        if k2 > 0:
+            hop2_id_splits = torch.split_with_sizes(all_neighbors.hop2_ids, group_sizes, dim=0)
+            hop2_time_splits = torch.split_with_sizes(all_neighbors.hop2_times, group_sizes, dim=0)
+            hop2_feat_splits = torch.split_with_sizes(all_neighbors.hop2_feats, group_sizes, dim=0)
+            hop2_mask_splits = torch.split_with_sizes(all_neighbors.hop2_mask, group_sizes, dim=0)
+
+        def _build_nbr(idx: int) -> NeighborData:
+            nd = NeighborData(splits[idx], time_splits[idx], feat_splits[idx], mask_splits[idx])
+            if k2 > 0:
+                nd.hop2_ids = hop2_id_splits[idx]
+                nd.hop2_times = hop2_time_splits[idx]
+                nd.hop2_feats = hop2_feat_splits[idx]
+                nd.hop2_mask = hop2_mask_splits[idx]
+            return nd
+
         idx = 0
         src_nbrs = dst_nbrs = neg_nbrs = None
 
         if "src" in self.spec.neighbors.for_nodes:
-            src_nbrs = NeighborData(splits[idx], time_splits[idx], feat_splits[idx], mask_splits[idx])
+            src_nbrs = _build_nbr(idx)
             idx += 1
         if "dst" in self.spec.neighbors.for_nodes:
-            dst_nbrs = NeighborData(splits[idx], time_splits[idx], feat_splits[idx], mask_splits[idx])
+            dst_nbrs = _build_nbr(idx)
             idx += 1
         if "neg" in self.spec.neighbors.for_nodes and raw_batch.neg is not None:
-            neg_nbrs = NeighborData(splits[idx], time_splits[idx], feat_splits[idx], mask_splits[idx])
+            neg_nbrs = _build_nbr(idx)
             idx += 1
 
         co_occur = None

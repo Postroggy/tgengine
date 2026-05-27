@@ -128,6 +128,48 @@ class TemporalGraph:
             mask=out_mask,
         )
 
+    def recent_2hop(self, nodes: Tensor, times: Tensor, k1: int, k2: int) -> NeighborData:
+        """Get 1-hop and 2-hop neighbors for each query node.
+
+        2-hop neighbors are the neighbors of each 1-hop neighbor, queried at
+        the 1-hop interaction timestamp to respect temporal causality.
+
+        Args:
+            nodes: (N,) node IDs to query.
+            times: (N,) query timestamps.
+            k1: number of 1-hop neighbors.
+            k2: number of 2-hop neighbors per 1-hop neighbor.
+
+        Returns:
+            NeighborData with hop2_* fields populated. 2-hop positions
+            corresponding to invalid 1-hop positions are masked out.
+        """
+        hop1 = self.recent(nodes, times, k1)  # (N, K1)
+
+        N, K1 = hop1.neighbor_ids.shape
+        flat_nbrs = hop1.neighbor_ids.reshape(-1)                # (N*K1,)
+        flat_nbr_times = hop1.timestamps.reshape(-1)             # (N*K1,)
+
+        hop2 = self.recent(flat_nbrs, flat_nbr_times, k2)       # (N*K1, K2)
+
+        hop2_ids = hop2.neighbor_ids.reshape(N, K1, k2)
+        hop2_times = hop2.timestamps.reshape(N, K1, k2)
+        hop2_feats = hop2.edge_feats.reshape(N, K1, k2, self.edge_feat_dim)
+        hop2_mask = hop2.mask.reshape(N, K1, k2)
+
+        # Mask out 2-hop for invalid 1-hop positions
+        hop1_valid = hop1.mask.unsqueeze(-1)  # (N, K1, 1)
+        hop2_mask = hop2_mask & hop1_valid
+        hop2_ids = hop2_ids.masked_fill(~hop2_mask, self.PADDING_ID)
+        hop2_times = hop2_times.masked_fill(~hop2_mask, 0.0)
+        hop2_feats = hop2_feats.masked_fill(~hop2_mask.unsqueeze(-1), 0.0)
+
+        hop1.hop2_ids = hop2_ids
+        hop1.hop2_times = hop2_times
+        hop1.hop2_feats = hop2_feats
+        hop1.hop2_mask = hop2_mask
+        return hop1
+
     def co_neighbors(self, src: Tensor, dst: Tensor, times: Tensor, k: int = 32) -> Tensor:
         """Compute co-occurrence counts between src and dst neighbor sets.
 
