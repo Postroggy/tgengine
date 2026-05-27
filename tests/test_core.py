@@ -1,5 +1,6 @@
 """Basic smoke test for TGEngine core components."""
 
+import pytest
 import torch
 
 from tgengine.core.temporal_graph import TemporalGraph
@@ -114,7 +115,7 @@ def test_model_instantiation():
 
 
 def test_dygmamba_forward():
-    """End-to-end forward pass for DyGMamba."""
+    """End-to-end forward pass for DyGMamba (CPU → GRU fallback)."""
     device = "cpu"
     B, K, d = 4, 8, 16
 
@@ -139,6 +140,44 @@ def test_dygmamba_forward():
     assert output.pos_score.shape == (B,)
     assert output.neg_score.shape == (B,)
     assert output.loss.item() > 0
+
+
+def test_mamba_gpu_forward():
+    """DyGMamba forward pass on GPU uses Mamba SSM (not GRU fallback)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    B, K, d = 4, 8, 16
+
+    def _dummy_nbrs():
+        return NeighborData(
+            torch.randint(0, 10, (B, K), dtype=torch.int32, device=device),
+            torch.rand(B, K, dtype=torch.float64, device=device),
+            torch.randn(B, K, d, device=device),
+            torch.ones(B, K, dtype=torch.bool, device=device),
+        )
+
+    model = DyGMamba(d_model=d, d_edge=d, n_layers=1).to(device)
+    assert model.encoder._has_mamba, "Mamba should be available on CUDA"
+
+    batch = __import__('tgengine').PreparedBatch(
+        src=torch.arange(B, device=device),
+        dst=torch.arange(B, device=device) + B,
+        neg=torch.arange(B, device=device) + 2 * B,
+        time=torch.ones(B, dtype=torch.float64, device=device),
+        src_neighbors=_dummy_nbrs(),
+        dst_neighbors=_dummy_nbrs(),
+        neg_neighbors=_dummy_nbrs(),
+    )
+    output = model(batch)
+    assert output.pos_score.shape == (B,)
+    assert output.loss.item() > 0
+    output.loss.backward()
+    # Verify Mamba params received gradients
+    for name, p in model.named_parameters():
+        if "mamba" in name and p.requires_grad:
+            assert p.grad is not None, f"Mamba param {name} has no gradient"
 
 
 def test_dygformer_forward():

@@ -20,7 +20,7 @@ from tgengine.pipeline.negatives import RandomNegative
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _small_setup(device="cpu"):
+def _small_setup(device="cuda"):
     """Create a small Engine setup for fast testing.
 
     Graph: 30 nodes, buffer=16, edge_feat_dim=8
@@ -33,20 +33,20 @@ def _small_setup(device="cpu"):
     graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=device)
 
     # Seed graph with history
-    src_h = torch.randint(0, N, (80,))
-    dst_h = torch.randint(0, N, (80,))
-    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64)
-    ef_h = torch.randn(80, d)
+    src_h = torch.randint(0, N, (80,), device=device)
+    dst_h = torch.randint(0, N, (80,), device=device)
+    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64, device=device)
+    ef_h = torch.randn(80, d, device=device)
     graph.advance(src_h, dst_h, ts_h, ef_h)
 
     # Create chronological train batches (after history)
     train_batches = []
     for i in range(12):
         train_batches.append(RawBatch(
-            src=torch.randint(0, N, (8,)),
-            dst=torch.randint(0, N, (8,)),
-            time=torch.full((8,), 90.0 + i, dtype=torch.float64),
-            edge_feat=torch.randn(8, d),
+            src=torch.randint(0, N, (8,), device=device),
+            dst=torch.randint(0, N, (8,), device=device),
+            time=torch.full((8,), 90.0 + i, dtype=torch.float64, device=device),
+            edge_feat=torch.randn(8, d, device=device),
         ))
 
     val_batches = train_batches[8:12]
@@ -68,31 +68,30 @@ def _small_setup(device="cpu"):
 
 def test_training_overfits_on_fixed_batch():
     """Loss should decrease when repeatedly training on the same batch."""
-    N, K, d = 30, 4, 8
-    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device="cpu")
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
 
-    # Seed history then add the batch edges
     graph.advance(
-        torch.randint(0, N, (50,)),
-        torch.randint(0, N, (50,)),
-        torch.linspace(0, 50, 50, dtype=torch.float64),
-        torch.randn(50, d),
+        torch.randint(0, N, (50,), device=dev),
+        torch.randint(0, N, (50,), device=dev),
+        torch.linspace(0, 50, 50, dtype=torch.float64, device=dev),
+        torch.randn(50, d, device=dev),
     )
 
     batch = RawBatch(
-        src=torch.arange(4), dst=torch.arange(4, 8),
-        time=torch.full((4,), 60.0, dtype=torch.float64),
-        edge_feat=torch.randn(4, d),
-        neg=torch.randint(0, N, (4,)),
+        src=torch.arange(4, device=dev), dst=torch.arange(4, 8, device=dev),
+        time=torch.full((4,), 60.0, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(4, d, device=dev),
+        neg=torch.randint(0, N, (4,), device=dev),
     )
 
-    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1).to(dev)
     pipeline = DataPipeline(model.gather_spec, graph)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    opt = torch.optim.Adam(model.parameters(), lr=5e-3)
     model.train()
 
     losses = []
-    for _ in range(30):
+    for _ in range(80):
         prepared = pipeline.prepare(batch)
         opt.zero_grad()
         out = model(prepared)
@@ -137,28 +136,28 @@ def test_graph_preserved_after_eval():
 
 def test_three_way_eval_produces_three_metrics():
     """ThreeWayEval produces ap_random, ap_historical, ap_inductive."""
-    N, K, d = 30, 4, 8
-    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device="cpu")
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
 
-    src_h = torch.randint(0, N, (80,))
-    dst_h = torch.randint(0, N, (80,))
-    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64)
-    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d))
+    src_h = torch.randint(0, N, (80,), device=dev)
+    dst_h = torch.randint(0, N, (80,), device=dev)
+    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64, device=dev)
+    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d, device=dev))
 
     eval_batches = []
     for i in range(4):
         eval_batches.append(RawBatch(
-            src=torch.randint(0, N, (6,)),
-            dst=torch.randint(0, N, (6,)),
-            time=torch.full((6,), 90.0 + i, dtype=torch.float64),
-            edge_feat=torch.randn(6, d),
+            src=torch.randint(0, N, (6,), device=dev),
+            dst=torch.randint(0, N, (6,), device=dev),
+            time=torch.full((6,), 90.0 + i, dtype=torch.float64, device=dev),
+            edge_feat=torch.randn(6, d, device=dev),
         ))
 
-    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1).to(dev)
     pipeline = DataPipeline(model.gather_spec, graph)
-    inductive_nodes = torch.arange(20, 30)  # nodes 20-29 as inductive
+    inductive_nodes = torch.arange(20, 30, device=dev)
 
-    evaluator = ThreeWayEval(N, inductive_nodes, device="cpu")
+    evaluator = ThreeWayEval(N, inductive_nodes, device=dev)
     metrics = evaluator.evaluate(model, pipeline, eval_batches, graph)
 
     assert "ap_random" in metrics
@@ -170,30 +169,29 @@ def test_three_way_eval_produces_three_metrics():
 
 def test_mrr_eval():
     """MRREval produces valid MRR score."""
-    N, K, d = 30, 4, 8
-    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device="cpu")
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
 
-    src_h = torch.randint(0, N, (80,))
-    dst_h = torch.randint(0, N, (80,))
-    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64)
-    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d))
+    src_h = torch.randint(0, N, (80,), device=dev)
+    dst_h = torch.randint(0, N, (80,), device=dev)
+    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64, device=dev)
+    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d, device=dev))
 
-    # Create eval batches with aligned neg lists
     N_eval, N_neg = 4, 5
     eval_batches = []
     neg_rows = []
     for i in range(N_eval):
         eval_batches.append(RawBatch(
-            src=torch.randint(0, N, (6,)),
-            dst=torch.randint(0, N, (6,)),
-            time=torch.full((6,), 90.0 + i, dtype=torch.float64),
-            edge_feat=torch.randn(6, d),
+            src=torch.randint(0, N, (6,), device=dev),
+            dst=torch.randint(0, N, (6,), device=dev),
+            time=torch.full((6,), 90.0 + i, dtype=torch.float64, device=dev),
+            edge_feat=torch.randn(6, d, device=dev),
         ))
-        neg_rows.append(torch.randint(0, N, (6, N_neg)))
+        neg_rows.append(torch.randint(0, N, (6, N_neg), device=dev))
 
     neg_tensor = torch.cat(neg_rows, dim=0)  # (N_eval*6, N_neg)
 
-    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1).to(dev)
     pipeline = DataPipeline(model.gather_spec, graph)
 
     evaluator = MRREval(neg_tensor)
@@ -206,21 +204,21 @@ def test_mrr_eval():
 
 def test_early_stopping():
     """Engine stops early when val score does not improve."""
-    N, K, d = 30, 4, 8
-    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device="cpu")
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
 
-    src_h = torch.randint(0, N, (80,))
-    dst_h = torch.randint(0, N, (80,))
-    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64)
-    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d))
+    src_h = torch.randint(0, N, (80,), device=dev)
+    dst_h = torch.randint(0, N, (80,), device=dev)
+    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64, device=dev)
+    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d, device=dev))
 
     train_batches = []
     for i in range(8):
         train_batches.append(RawBatch(
-            src=torch.randint(0, N, (4,)),
-            dst=torch.randint(0, N, (4,)),
-            time=torch.full((4,), 90.0 + i, dtype=torch.float64),
-            edge_feat=torch.randn(4, d),
+            src=torch.randint(0, N, (4,), device=dev),
+            dst=torch.randint(0, N, (4,), device=dev),
+            time=torch.full((4,), 90.0 + i, dtype=torch.float64, device=dev),
+            edge_feat=torch.randn(4, d, device=dev),
         ))
 
     val_batches = test_batches = train_batches[4:8]
@@ -229,9 +227,8 @@ def test_early_stopping():
     neg_strat = RandomNegative(N)
     eval_proto = APEval()
 
-    # patience=1 — should stop by epoch 3 at latest
     config = TrainConfig(epochs=50, batch_size=4, lr=1e-3, patience=1,
-                         device="cpu", seed=42)
+                         device=dev, seed=42)
     engine = Engine(model, graph, train_batches, val_batches, test_batches,
                     neg_strat, eval_proto, config)
     metrics = engine.train()
@@ -275,21 +272,21 @@ def test_auto_checkpoint_on_best():
     import os
     import tempfile
 
-    N, K, d = 30, 4, 8
-    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device="cpu")
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
 
-    src_h = torch.randint(0, N, (80,))
-    dst_h = torch.randint(0, N, (80,))
-    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64)
-    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d))
+    src_h = torch.randint(0, N, (80,), device=dev)
+    dst_h = torch.randint(0, N, (80,), device=dev)
+    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64, device=dev)
+    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d, device=dev))
 
     train_batches = []
     for i in range(8):
         train_batches.append(RawBatch(
-            src=torch.randint(0, N, (4,)),
-            dst=torch.randint(0, N, (4,)),
-            time=torch.full((4,), 90.0 + i, dtype=torch.float64),
-            edge_feat=torch.randn(4, d),
+            src=torch.randint(0, N, (4,), device=dev),
+            dst=torch.randint(0, N, (4,), device=dev),
+            time=torch.full((4,), 90.0 + i, dtype=torch.float64, device=dev),
+            edge_feat=torch.randn(4, d, device=dev),
         ))
 
     val_batches = test_batches = train_batches[4:8]
@@ -299,7 +296,7 @@ def test_auto_checkpoint_on_best():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         config = TrainConfig(epochs=10, batch_size=4, lr=1e-3, patience=3,
-                             device="cpu", seed=42, checkpoint_dir=tmpdir)
+                             device=dev, seed=42, checkpoint_dir=tmpdir)
         engine = Engine(model, graph, train_batches, val_batches, test_batches,
                         neg_strat, APEval(), config)
         engine.train()
@@ -307,7 +304,6 @@ def test_auto_checkpoint_on_best():
         ckpt_path = os.path.join(tmpdir, "best.pt")
         assert os.path.exists(ckpt_path), f"checkpoint not found at {ckpt_path}"
 
-        # Verify it can be loaded
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         assert "model_state_dict" in ckpt
         assert "optimizer_state_dict" in ckpt
