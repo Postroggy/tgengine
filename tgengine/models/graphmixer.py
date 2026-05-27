@@ -36,7 +36,7 @@ from torch import Tensor
 from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
 from tgengine.models.base import ModelOutput, TemporalModel
-from tgengine.nn import HarmonicEncoder, MergeDecoder
+from tgengine.nn import FixedCosineTimeEncoder, MergeDecoder
 from tgengine.nn.mlp_mixer import MLPMixerLayer
 
 
@@ -76,8 +76,8 @@ class GraphMixer(TemporalModel):
             co_occurrence=False,
         )
 
-        # time encoding: fixed harmonic (non-trainable, matching reference)
-        self.time_enc = HarmonicEncoder(d_time)
+        # Fixed cosine time encoding matching DyGLib's GraphMixer exactly
+        self.time_enc = FixedCosineTimeEncoder(d_time)
 
         # num_channels = edge_feat_dim (as in reference)
         num_channels = d_edge
@@ -125,15 +125,12 @@ class GraphMixer(TemporalModel):
         combined = torch.cat([nbrs.edge_feats, t_feat], dim=-1)           # (B, K, d_edge+d_time)
         tokens = self.projection(combined)                                  # (B, K, num_channels)
 
-        # zero-pad invalid positions before mixing
-        tokens = tokens * nbrs.mask.unsqueeze(-1).float()
-
+        # DyGLib does NOT zero padding before mixing — padding positions participate in mixer
         for mixer in self.mixers:
             tokens = mixer(tokens)                                          # (B, K, num_channels)
 
-        # masked mean pool
-        m = nbrs.mask.float().unsqueeze(-1)                               # (B, K, 1)
-        link_feat = (tokens * m).sum(1) / m.sum(1).clamp(min=1)          # (B, num_channels)
+        # Simple mean over all K positions (including padding), matching DyGLib
+        link_feat = tokens.mean(dim=1)                                     # (B, num_channels)
 
         # ---- node encoder ----
         if self.node_raw_features is not None:
@@ -167,9 +164,10 @@ class GraphMixer(TemporalModel):
         return True
 
     def encode_nodes(self, neighbors, times):
-        # Dummy nodes tensor (not used for node encoder path in MRR)
-        dummy_nodes = torch.zeros(neighbors.batch_size, dtype=torch.long,
-                                  device=neighbors.device)
+        # node_raw_features not used for GraphMixer MRR (link encoder only)
+        # If node_raw_features is set, callers must pass real node IDs via _encode directly
+        B = neighbors.neighbor_ids.shape[0]
+        dummy_nodes = torch.zeros(B, dtype=torch.long, device=neighbors.neighbor_ids.device)
         return self._encode(dummy_nodes, neighbors, times)
 
     def score_pairs(self, src_emb: Tensor, dst_emb: Tensor) -> Tensor:

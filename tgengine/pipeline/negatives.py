@@ -142,6 +142,9 @@ class NegativeStrategy(ABC):
         """
         ...
 
+    def update(self, src: Tensor, dst: Tensor) -> None:
+        """Ingest new edges (called alongside graph.advance()). No-op by default."""
+
 
 class RandomNegative(NegativeStrategy):
     """Uniform random negative sampling. O(1), GPU-native."""
@@ -154,57 +157,34 @@ class RandomNegative(NegativeStrategy):
 
 
 class HistoricalNegative(NegativeStrategy):
-    """Sample negatives from src's historical neighbors (ring buffer).
+    """Sample negatives uniformly from src's *full* interaction history.
 
-    Complexity: O(B * k) regardless of dataset size.  Always uses
-    graph.recent() — call sample_from_neighbors() inside DataPipeline
-    to avoid the redundant src query.
+    Semantically equivalent to DyGLib/TGM historical negative sampling:
+    every past (src, dst) edge has equal probability of being selected.
+
+    Internally wraps HistoricalNegPool (reservoir sampling, O(num_nodes *
+    pool_size) GPU memory, O(B) sampling).  Call update(src, dst) alongside
+    graph.advance() on every training batch so the pool stays current with
+    the training set history.
+
+    Memory: num_nodes * pool_size * 4 bytes (int32).
+    Wikipedia (~9k nodes, pool_size=512) ≈ 18 MB.
+    Reddit  (~232k nodes, pool_size=512) ≈ 475 MB.
+
+    NOTE: pool 存的是 bounded reservoir sample（最多 pool_size/节点），不是全量历史。
+    但 reservoir sampling 保证采样语义等价于全量历史均匀采样。
     """
 
-    def __init__(self, num_nodes: int, k: int = 32):
+    def __init__(self, num_nodes: int, pool_size: int = 512, device: str = "cuda"):
+        self._pool = HistoricalNegPool(num_nodes, pool_size=pool_size, device=device)
         self.num_nodes = num_nodes
-        self.k = k
+
+    def update(self, src: Tensor, dst: Tensor) -> None:
+        """Ingest new edges into the reservoir pool. Call alongside graph.advance()."""
+        self._pool.update(src, dst)
 
     def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph) -> Tensor:
-        """Standalone sample — makes a separate graph.recent(src) call.
-
-        Prefer DataPipeline.prepare_with_hist_neg() to avoid querying
-        src neighbors twice.
-        """
-        nbrs = graph.recent(src, time, k=self.k)
-        return self.sample_from_neighbors(nbrs, self.num_nodes)
-
-    @staticmethod
-    def sample_from_neighbors(src_nbrs: NeighborData, num_nodes: int) -> Tensor:
-        """Vectorized neg selection from already-queried src neighbors.
-
-        No additional graph.recent() call needed — src_nbrs come from
-        the pipeline's existing fused query.
-
-        Args:
-            src_nbrs: NeighborData(B, K) — src neighbors already obtained.
-            num_nodes: fallback upper bound for random sampling.
-
-        Returns:
-            (B,) tensor of negative node IDs.
-        """
-        device = src_nbrs.neighbor_ids.device
-        B, K = src_nbrs.neighbor_ids.shape
-        valid_counts = src_nbrs.mask.sum(dim=1)  # (B,)
-
-        # Random index in [0, valid_count) per row — vectorized
-        rand_idx = (torch.rand(B, device=device) * valid_counts.float()).long()
-        rand_idx = rand_idx.clamp(max=K - 1)  # (B,)
-
-        neg = src_nbrs.neighbor_ids.gather(1, rand_idx.unsqueeze(1)).squeeze(1).long()
-
-        # Nodes with no history: fall back to random
-        no_history = valid_counts == 0
-        if no_history.any():
-            neg[no_history] = torch.randint(
-                0, num_nodes, (int(no_history.sum()),), device=device
-            )
-        return neg
+        return self._pool.sample(src)
 
 
 class InductiveNegative(NegativeStrategy):

@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from tgengine.pipeline.negatives import HistoricalNegPool
+from tgengine.pipeline.negatives import HistoricalNegPool, HistoricalNegative
 from tgengine.core.temporal_graph import TemporalGraph
 from tgengine.core.batch import RawBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
@@ -174,3 +174,85 @@ def test_co_occur_fusion_no_extra_kernel_call():
     assert (result >= 0).all()
     # With random IDs in [0, 20) and k=8, some overlap is expected
     assert result.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# HistoricalNegative (new, correct full-history semantics)
+# ---------------------------------------------------------------------------
+
+def test_historical_negative_update_and_sample():
+    """HistoricalNegative.update() + sample() returns valid historical nodes."""
+    num_nodes = 50
+    strategy = HistoricalNegative(num_nodes=num_nodes, pool_size=64, device="cpu")
+
+    src = torch.tensor([0, 0, 0, 1, 1])
+    dst = torch.tensor([10, 20, 30, 40, 41])
+    strategy.update(src, dst)
+
+    neg = strategy.sample(src[:3], dst[:3], torch.zeros(3), graph=None)
+    assert neg.shape == (3,)
+    # node 0 has history {10, 20, 30}, so sampled negatives must come from there
+    assert set(neg.tolist()).issubset({10, 20, 30}), f"unexpected negatives: {neg.tolist()}"
+
+
+def test_historical_negative_uniform_distribution():
+    """HistoricalNegative samples uniformly from full history (not just recent K)."""
+    num_nodes = 200
+    pool_size = 100
+    strategy = HistoricalNegative(num_nodes=num_nodes, pool_size=pool_size, device="cpu")
+
+    # Give node 0 exactly 3 historical neighbors
+    src = torch.zeros(3, dtype=torch.long)
+    dst = torch.tensor([1, 2, 3])
+    strategy.update(src, dst)
+
+    counts = {1: 0, 2: 0, 3: 0}
+    n_trials = 3000
+    neg = strategy.sample(torch.zeros(n_trials, dtype=torch.long),
+                          torch.zeros(n_trials, dtype=torch.long),
+                          torch.zeros(n_trials), graph=None)
+    for v in neg.tolist():
+        if v in counts:
+            counts[v] += 1
+
+    total = sum(counts.values())
+    assert total == n_trials, f"unexpected fallback sampling: {total} != {n_trials}"
+    for v, c in counts.items():
+        freq = c / n_trials
+        assert 0.25 < freq < 0.45, f"node {v} freq={freq:.3f}, expected ~0.333"
+
+
+def test_historical_negative_covers_beyond_ring_buffer():
+    """HistoricalNegative samples from the FULL history, not just recent K.
+
+    The key semantic guarantee: even if a node has 100 interactions, all of them
+    should have equal probability of being sampled — not just the last K=32
+    (which a ring-buffer-only approach would be limited to).
+    """
+    num_nodes = 150
+    k_recent = 32  # ring buffer window size for comparison
+    pool_size = 128
+    strategy = HistoricalNegative(num_nodes=num_nodes, pool_size=pool_size, device="cpu")
+
+    # Node 0 has 100 interactions; the first 68 are older than ring buffer window
+    n_interactions = 100
+    src = torch.zeros(n_interactions, dtype=torch.long)
+    dst = torch.arange(1, n_interactions + 1)  # dsts: 1..100
+    strategy.update(src, dst)
+
+    # Sample many times and check which dst nodes appear
+    n_trials = 5000
+    neg = strategy.sample(torch.zeros(n_trials, dtype=torch.long),
+                          torch.zeros(n_trials, dtype=torch.long),
+                          torch.zeros(n_trials), graph=None)
+
+    seen = set(neg.tolist())
+    # Old neighbors (1..68) should appear — not possible with ring-buffer-only approach
+    old_neighbors = set(range(1, n_interactions - k_recent + 1))
+    overlap = seen & old_neighbors
+    assert len(overlap) > 0, (
+        f"HistoricalNegative should sample from full history but none of the "
+        f"old neighbors {sorted(old_neighbors)[:5]}... appeared in {n_trials} trials"
+    )
+
+

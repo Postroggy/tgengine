@@ -206,11 +206,12 @@ def test_tgn_forward_and_lifecycle():
         edge_feat=torch.randn(B, d),
     )
     # memory should have changed
-    assert not torch.allclose(model.memory.memory[:B], state[:B])
+    state_mem, state_times = state  # checkpoint() now returns (memory, last_updated_times)
+    assert not torch.allclose(model.memory.memory[:B], state_mem[:B])
 
     # thaw should restore original state
     model.thaw(state)
-    assert torch.allclose(model.memory.memory, state)
+    assert torch.allclose(model.memory.memory, state_mem)
 
 
 def test_pipeline_fused_query():

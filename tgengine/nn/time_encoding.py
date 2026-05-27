@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -31,6 +32,35 @@ class Time2Vec(nn.Module):
         out = self.w(dt)  # (..., d_model)
         # First dimension is linear, rest are sinusoidal — use cat to avoid inplace
         return torch.cat([out[..., :1], torch.sin(out[..., 1:])], dim=-1)
+
+
+class FixedCosineTimeEncoder(nn.Module):
+    """Fixed cosine time encoding matching DyGLib's TimeEncoder exactly.
+
+    Uses frequencies w = 1 / 10^linspace(0, 9, d_model) (fixed, not learnable).
+    This is the time encoder used in DyGFormer and GraphMixer reference implementations.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        # DyGLib: w = 1/10^linspace(0,9,d) → frequencies from 1 to 1e-9
+        w = 1.0 / (10 ** np.linspace(0, 9, d_model, dtype=np.float32))
+        # Use nn.Linear with frozen weights (bias=0) to get w*t
+        lin = nn.Linear(1, d_model, bias=True)
+        lin.weight = nn.Parameter(torch.from_numpy(w).reshape(d_model, 1), requires_grad=False)
+        lin.bias = nn.Parameter(torch.zeros(d_model), requires_grad=False)
+        self.linear = lin
+
+    def forward(self, dt: Tensor) -> Tensor:
+        """
+        Args:
+            dt: (...) time deltas.
+
+        Returns:
+            (..., d_model) cosine time features.
+        """
+        return torch.cos(self.linear(dt.float().unsqueeze(-1)))  # (..., d_model)
 
 
 class HarmonicEncoder(nn.Module):

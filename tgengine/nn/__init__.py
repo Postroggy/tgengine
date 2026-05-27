@@ -9,12 +9,13 @@ from .seq_encoder import (
     SequenceEncoder,
     TransformerSeqEncoder,
 )
-from .time_encoding import HarmonicEncoder, Time2Vec
+from .time_encoding import FixedCosineTimeEncoder, HarmonicEncoder, Time2Vec
 
 __all__ = [
     "BilinearDecoder",
     "CoNeighborEncoder",
     "ConcatMLPDecoder",
+    "FixedCosineTimeEncoder",
     "FeedForwardNet",
     "FilterLayer",
     "FreeDyGMixerLayer",

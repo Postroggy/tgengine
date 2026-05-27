@@ -83,20 +83,33 @@ class TGN(TemporalModel):
     # --- Stateful lifecycle ---
 
     def evolve(self, src: Tensor, dst: Tensor, time: Tensor, edge_feat: Optional[Tensor] = None):
-        """Update node memories after observing a batch of interactions."""
+        """Update node memories after observing a batch of interactions.
+
+        Message for src: cat([mem_src, mem_dst, delta_time_enc, edge])
+        Message for dst: cat([mem_dst, mem_src, delta_time_enc, edge])  ← args swapped
+        delta_time = current_time - node.last_updated_time  (matches DyGLib TGN)
+        """
         if edge_feat is None:
             edge_feat = torch.zeros(src.shape[0], self.d_edge, device=src.device)
 
         src_mem = self.memory.read(src)   # (B, d)
-        dst_mem = self.memory.read(dst)   # (B, d)
-        t_enc = self.time_enc(time.float())  # (B, d_model) — encode interaction timestamp
+        dst_mem = self.memory.read(dst)
 
-        msg_input = torch.cat([src_mem, dst_mem, t_enc, edge_feat], dim=-1)
-        msg = self.msg_fn(msg_input)  # (B, d)
+        # Delta times since last memory update (recency signal)
+        t = time.float()
+        src_dt = (t - self.memory.last_times(src)).clamp(min=0)  # (B,)
+        dst_dt = (t - self.memory.last_times(dst)).clamp(min=0)
 
-        # Update: src receives message about its interaction, dst symmetric
-        self.memory.update(src, msg)
-        self.memory.update(dst, msg)
+        src_t_enc = self.time_enc(src_dt)  # (B, d_model)
+        dst_t_enc = self.time_enc(dst_dt)
+
+        # Src message: [src_mem | dst_mem | time | edge]
+        src_msg = self.msg_fn(torch.cat([src_mem, dst_mem, src_t_enc, edge_feat], dim=-1))
+        # Dst message: [dst_mem | src_mem | time | edge]  — swapped memory order
+        dst_msg = self.msg_fn(torch.cat([dst_mem, src_mem, dst_t_enc, edge_feat], dim=-1))
+
+        self.memory.update(src, src_msg, t)
+        self.memory.update(dst, dst_msg, t)
 
     def freeze(self) -> Any:
         return self.memory.checkpoint()

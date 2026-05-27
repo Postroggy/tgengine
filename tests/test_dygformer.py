@@ -113,7 +113,7 @@ def test_forward_sparse_mask():
 # ---------------------------------------------------------------------------
 
 def test_gradient_flow():
-    """Every parameter must receive a gradient on backward."""
+    """Every trainable parameter must receive a gradient on backward."""
     B, K, d = 4, 8, 16
     model = DyGFormer(d_model=32, d_edge=d, d_time=8, d_channel=8, K=K)
     batch = _make_batch(B, K, d)
@@ -121,8 +121,12 @@ def test_gradient_flow():
     out = model(batch)
     out.loss.backward()
 
-    no_grad = [name for name, p in model.named_parameters() if p.grad is None]
-    assert not no_grad, f"Parameters with no gradient: {no_grad}"
+    # Only check requires_grad=True parameters; FixedCosineTimeEncoder weights are intentionally frozen
+    no_grad = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and p.grad is None
+    ]
+    assert not no_grad, f"Trainable parameters with no gradient: {no_grad}"
 
 
 # ---------------------------------------------------------------------------

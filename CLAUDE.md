@@ -100,6 +100,36 @@ tgengine/
 - 参考 DyGLib 代码：`/Users/xg/Coding/PersonalFile/Claude_DyG/code-refs/exp_sourcecode/`
 - 研究项目上下文：`/Users/xg/Coding/PersonalFile/Claude_DyG/CLAUDE.md`
 
+## GPU 使用约束（重要）
+
+服务器 `scnu` 有 4 张 GPU，编号如下：
+
+```
+nvidia-smi GPU 0: RTX 3090 (25.3 GB) ← 同学使用，禁止占用
+nvidia-smi GPU 1: RTX 4080 (16.7 GB) ← 我们专用
+nvidia-smi GPU 2: RTX 3090 (25.3 GB) ← 同学使用，禁止占用
+nvidia-smi GPU 3: RTX 3090 (25.3 GB) ← 同学使用，禁止占用
+```
+
+⚠️ **注意：nvidia-smi 编号 ≠ CUDA device 编号（取决于 CUDA_DEVICE_ORDER）**
+
+**不设置 `CUDA_DEVICE_ORDER`（默认，当前服务器状态）：**
+- CUDA device 0 = nvidia-smi GPU 1 = RTX 4080 ← **唯一可用**
+- CUDA device 1/2/3 = nvidia-smi GPU 0/2/3 = RTX 3090 ← **禁止使用**
+
+**若设置了 `CUDA_DEVICE_ORDER=PCI_BUS_ID`（匹配 nvidia-smi）：**
+- CUDA device 0 = nvidia-smi GPU 0 = RTX 3090 ← **禁止！**
+- CUDA device 1 = nvidia-smi GPU 1 = RTX 4080 ← 此时需改用 `CUDA_VISIBLE_DEVICES=1`
+
+**所有在 scnu 上运行的脚本，不得设置 `CUDA_DEVICE_ORDER`，且必须设置 `CUDA_VISIBLE_DEVICES=0`**：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/xxx.py
+CUDA_VISIBLE_DEVICES=0 conda run -n PyGBase python -m pytest tests/ -v
+```
+
+RTX 4080 显存 16.7 GB；Reddit ring buffer 在 K=32 时约 14.8 GB，需自动降到 K≤17。
+
 ## 开发规范
 
 - Commit message: English
