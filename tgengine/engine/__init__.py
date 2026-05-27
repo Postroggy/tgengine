@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 from typing import Any, Optional
 
 import torch
@@ -30,7 +31,8 @@ class TrainConfig:
     patience: int = 10
     device: str = "cuda"
     seed: int = 42
-    async_pipeline: bool = False  # prefetch batch i+1 while computing batch i
+    async_pipeline: bool = False   # prefetch batch i+1 while computing batch i
+    checkpoint_dir: Optional[str] = None  # if set, auto-save best checkpoint here
 
 
 class EvalProtocol(ABC):
@@ -262,14 +264,48 @@ class Engine:
             else None
         )
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        self._current_epoch = 0
+        self._best_val = 0.0
 
-    def train(self) -> dict[str, float]:
-        """Run full training loop. Returns best test metrics."""
-        best_val = 0.0
-        best_test = {}
+    def save_checkpoint(self, path: str) -> None:
+        """Save full training state to a checkpoint file.
+
+        Saves: model weights, optimizer state, epoch, best_val, config.
+        """
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "epoch": self._current_epoch,
+            "best_val": self._best_val,
+            "config": self.config,
+        }
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(checkpoint, path)
+
+    def load_checkpoint(self, path: str) -> int:
+        """Restore model, optimizer, and training state from checkpoint.
+
+        Returns the epoch number to resume from.
+        """
+        checkpoint = torch.load(path, map_location=self.config.device, weights_only=False)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self._current_epoch = checkpoint["epoch"]
+        self._best_val = checkpoint["best_val"]
+        return self._current_epoch
+
+    def train(self, resume: bool = False) -> dict[str, float]:
+        """Run full training loop. Returns best test metrics.
+
+        If config.checkpoint_dir is set, automatically saves the best
+        checkpoint to ``{checkpoint_dir}/best.pt``.
+        """
+        best_val = self._best_val if resume else 0.0
+        best_test: dict[str, float] = {}
         patience_counter = 0
 
-        for epoch in range(1, self.config.epochs + 1):
+        for epoch in range(self._current_epoch + 1, self.config.epochs + 1):
+            self._current_epoch = epoch
             train_loss = self._train_epoch()
 
             # Evaluate
@@ -278,8 +314,14 @@ class Engine:
 
             if val_score > best_val:
                 best_val = val_score
+                self._best_val = best_val
                 best_test = self._evaluate(self.test_batches)
                 patience_counter = 0
+
+                # Auto-save best checkpoint
+                if self.config.checkpoint_dir is not None:
+                    save_path = os.path.join(self.config.checkpoint_dir, "best.pt")
+                    self.save_checkpoint(save_path)
             else:
                 patience_counter += 1
 

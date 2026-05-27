@@ -239,3 +239,76 @@ def test_early_stopping():
     assert "ap" in metrics
     # If early stopping worked, we finished in far fewer than 50 epochs
     # This is implicitly tested by the test finishing quickly
+
+
+def test_checkpoint_save_load():
+    """Checkpoint save + load round-trip preserves model weights and optimizer state."""
+    import os
+    import tempfile
+
+    engine = _small_setup()
+    engine._current_epoch = 3
+    engine._best_val = 0.72
+
+    # Capture pre-save weights
+    pre_save = {k: v.clone() for k, v in engine.model.state_dict().items()}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "best.pt")
+        engine.save_checkpoint(path)
+
+        # Modify weights
+        for p in engine.model.parameters():
+            p.data.add_(0.5)
+
+        engine.load_checkpoint(path)
+
+        for k, v in engine.model.state_dict().items():
+            assert torch.allclose(v, pre_save[k]), f"weight {k} diverged after load"
+
+        assert engine._current_epoch == 3
+        assert engine._best_val == 0.72
+
+
+def test_auto_checkpoint_on_best():
+    """Engine auto-saves checkpoint to checkpoint_dir when new best is found."""
+    import os
+    import tempfile
+
+    N, K, d = 30, 4, 8
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device="cpu")
+
+    src_h = torch.randint(0, N, (80,))
+    dst_h = torch.randint(0, N, (80,))
+    ts_h = torch.linspace(0, 80, 80, dtype=torch.float64)
+    graph.advance(src_h, dst_h, ts_h, torch.randn(80, d))
+
+    train_batches = []
+    for i in range(8):
+        train_batches.append(RawBatch(
+            src=torch.randint(0, N, (4,)),
+            dst=torch.randint(0, N, (4,)),
+            time=torch.full((4,), 90.0 + i, dtype=torch.float64),
+            edge_feat=torch.randn(4, d),
+        ))
+
+    val_batches = test_batches = train_batches[4:8]
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    neg_strat = RandomNegative(N)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = TrainConfig(epochs=10, batch_size=4, lr=1e-3, patience=3,
+                             device="cpu", seed=42, checkpoint_dir=tmpdir)
+        engine = Engine(model, graph, train_batches, val_batches, test_batches,
+                        neg_strat, APEval(), config)
+        engine.train()
+
+        ckpt_path = os.path.join(tmpdir, "best.pt")
+        assert os.path.exists(ckpt_path), f"checkpoint not found at {ckpt_path}"
+
+        # Verify it can be loaded
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        assert "model_state_dict" in ckpt
+        assert "optimizer_state_dict" in ckpt
+        assert ckpt["epoch"] > 0
