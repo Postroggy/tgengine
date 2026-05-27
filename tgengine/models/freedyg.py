@@ -70,8 +70,12 @@ class _NIFEncoder(nn.Module):
         cross  = cross.masked_fill(a_pad.unsqueeze(2)  | b_pad.unsqueeze(1), 0.0)
 
         # (B, K, 2): [self_count, cross_count]
-        a_freq = torch.stack([a_self.sum(1), cross.sum(1)], dim=2)
-        b_freq = torch.stack([b_self.sum(1), cross.sum(2)], dim=2)
+        # a_freq[b,i] = [count of a[b,i] in a, count of a[b,i] in b]
+        # b_freq[b,j] = [count of b[b,j] in a, count of b[b,j] in b]
+        # cross.sum(2)[b,i] = count of b positions matching a[b,i]
+        # cross.sum(1)[b,j] = count of a positions matching b[b,j]
+        a_freq = torch.stack([a_self.sum(1), cross.sum(2)], dim=2)
+        b_freq = torch.stack([cross.sum(1), b_self.sum(1)], dim=2)
 
         # project each scalar → d_out, sum over the 2 scalars
         a_feat = self.proj(a_freq.unsqueeze(-1)).sum(dim=2)            # (B, K, d_out)

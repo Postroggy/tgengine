@@ -13,6 +13,7 @@ Covers:
 
 import torch
 import pytest
+from torch import Tensor
 
 from tgengine.core.batch import NeighborData, PreparedBatch, RawBatch
 from tgengine.core.temporal_graph import TemporalGraph
@@ -38,6 +39,17 @@ def _make_nbrs(B: int, K: int, d: int) -> NeighborData:
         timestamps=torch.rand(B, K, dtype=torch.float64) * 50.0,
         edge_feats=torch.randn(B, K, d),
         mask=mask,
+    )
+
+
+def _nbrs_from_ids(ids: Tensor, d: int) -> NeighborData:
+    """Create deterministic NeighborData from given IDs (no randomness)."""
+    B, K = ids.shape
+    return NeighborData(
+        neighbor_ids=ids,
+        timestamps=torch.rand(B, K, dtype=torch.float64) * 50.0,
+        edge_feats=torch.randn(B, K, d),
+        mask=torch.ones(B, K, dtype=torch.bool),
     )
 
 
@@ -242,10 +254,13 @@ class TestFreeDyG:
         model = FreeDyG(d_model=32, d_edge=d, d_time=8, d_nif=16, K=K, num_layers=1)
         model.eval()
         with torch.no_grad():
-            # Same src neighbors, different dst neighbors
-            src_nbrs = _make_nbrs(B, K, d)
-            dst_nbrs_a = _make_nbrs(B, K, d)
-            dst_nbrs_b = _make_nbrs(B, K, d)
+            # Deterministic: src IDs [1,2,3,...], dst_a distinct, dst_b all same as src[0]
+            src_nbrs = _nbrs_from_ids(torch.tensor([[1,2,3,4,5,6,7,8],
+                                                     [9,10,11,12,13,14,15,16]], dtype=torch.int32), d)
+            dst_nbrs_a = _nbrs_from_ids(torch.tensor([[20,21,22,23,24,25,26,27],
+                                                       [30,31,32,33,34,35,36,37]], dtype=torch.int32), d)
+            dst_nbrs_b = _nbrs_from_ids(torch.tensor([[1,1,1,1,1,1,1,1],
+                                                       [9,9,9,9,9,9,9,9]], dtype=torch.int32), d)
             time = torch.full((B,), 100.0, dtype=torch.float64)
 
             emb_src_a, _ = model._encode_pair(src_nbrs, dst_nbrs_a, time)
