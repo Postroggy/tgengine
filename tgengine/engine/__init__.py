@@ -81,10 +81,10 @@ class ThreeWayEval(EvalProtocol):
         inductive_nodes: 1-D tensor of node IDs unseen during training.
     """
 
-    def __init__(self, num_nodes: int, inductive_nodes: Tensor):
+    def __init__(self, num_nodes: int, inductive_nodes: Tensor, device: str = "cuda"):
         self._strategies = {
             "random": RandomNegative(num_nodes),
-            "historical": HistoricalNegative(num_nodes),
+            "historical": HistoricalNegative(num_nodes, device=device),
             "inductive": InductiveNegative(inductive_nodes),
         }
 
@@ -192,7 +192,8 @@ class MRREval(EvalProtocol):
         cand_emb = model.encode_nodes(cand_nbrs, times_cand)    # (B*(1+N_neg), d)
         cand_emb = cand_emb.view(B, 1 + N_neg, -1)             # (B, 1+N_neg, d)
 
-        scores = model.score_pairs(src_emb.unsqueeze(1), cand_emb)  # (B, 1+N_neg)
+        src_emb_exp = src_emb.unsqueeze(1).expand(-1, 1 + N_neg, -1)  # (B, 1+N_neg, d)
+        scores = model.score_pairs(src_emb_exp, cand_emb)  # (B, 1+N_neg)
         pos_s = scores[:, 0:1]  # (B, 1)
         rank = (scores >= pos_s).sum(dim=1).float()  # (B,) 1-indexed rank
         return 1.0 / rank
