@@ -59,26 +59,51 @@ class TransformerSeqEncoder(SequenceEncoder):
 
 
 class MambaSeqEncoder(SequenceEncoder):
-    """Selective State Space Model encoder (Mamba)."""
+    """Selective State Space Model encoder (Mamba).
 
-    def __init__(self, d_model: int, n_layers: int = 2, d_state: int = 16):
+    Dispatches at forward time: Mamba (via mamba_ssm) on CUDA tensors,
+    GRU on CPU tensors. This lets the same model work in CPU tests and
+    GPU training without config changes.
+    """
+
+    def __init__(self, d_model: int, n_layers: int = 2, d_state: int = 16,
+                 d_conv: int = 4, expand: int = 2):
         super().__init__()
         self.d_model = d_model
         self.n_layers = n_layers
-        self.d_state = d_state
-        # TODO: import and use actual Mamba implementation
-        # For now, placeholder with GRU (same interface)
-        self.rnn = nn.GRU(d_model, d_model, num_layers=n_layers, batch_first=True)
+
+        # Always create GRU for CPU
+        self.gru = nn.GRU(d_model, d_model, num_layers=n_layers, batch_first=True)
+
+        # Optionally create Mamba layers for CUDA
+        self._has_mamba = False
+        if torch.cuda.is_available():
+            try:
+                from mamba_ssm import Mamba  # type: ignore[import-untyped]
+                self.mamba_layers = nn.ModuleList([
+                    Mamba(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+                    for _ in range(n_layers)
+                ])
+                self.mamba_norm = nn.LayerNorm(d_model)
+                self._has_mamba = True
+            except ImportError:
+                pass
 
     def forward(self, seq: Tensor, mask: Tensor) -> Tensor:
-        # Clamp to 1 so pack_padded_sequence never sees zero-length sequences
-        lengths = mask.sum(dim=1).cpu().clamp(min=1)
-        packed = nn.utils.rnn.pack_padded_sequence(
-            seq, lengths, batch_first=True, enforce_sorted=False
-        )
-        output, hidden = self.rnn(packed)
-        # Return last hidden state
-        return hidden[-1]
+        if self._has_mamba and seq.is_cuda:
+            out = seq
+            for layer in self.mamba_layers:
+                out = out + layer(out)  # residual
+            out = self.mamba_norm(out)
+            mask_f = mask.unsqueeze(-1).float()
+            return (out * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+        else:
+            lengths = mask.sum(dim=1).cpu().clamp(min=1)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                seq, lengths, batch_first=True, enforce_sorted=False
+            )
+            _, hidden = self.gru(packed)
+            return hidden[-1]
 
 
 class GRUSeqEncoder(SequenceEncoder):
