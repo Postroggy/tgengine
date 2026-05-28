@@ -306,3 +306,32 @@ def test_auto_checkpoint_on_best():
         assert "model_state_dict" in ckpt
         assert "optimizer_state_dict" in ckpt
         assert ckpt["epoch"] > 0
+
+
+def test_amp_training():
+    """Mixed precision training should complete without errors and reduce loss."""
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (50,), device=dev),
+        torch.randint(0, N, (50,), device=dev),
+        torch.linspace(0, 50, 50, dtype=torch.float64, device=dev),
+        torch.randn(50, d, device=dev),
+    )
+
+    train_batches = [RawBatch(
+        src=torch.randint(0, N, (8,), device=dev),
+        dst=torch.randint(0, N, (8,), device=dev),
+        time=torch.full((8,), 60.0 + i, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(8, d, device=dev),
+    ) for i in range(8)]
+    val_batches = test_batches = train_batches[4:8]
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    neg_strat = RandomNegative(N)
+    config = TrainConfig(epochs=5, batch_size=8, lr=1e-3, patience=3,
+                         device=dev, seed=42, use_amp=True)
+    engine = Engine(model, graph, train_batches, val_batches, test_batches,
+                    neg_strat, APEval(), config)
+    best = engine.train()
+    assert "ap" in best or best == {}

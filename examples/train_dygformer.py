@@ -28,6 +28,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision (fp16)")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Max gradient norm (0 to disable)")
+    parser.add_argument("--warmup_steps", type=int, default=0, help="Linear warmup steps")
     args = parser.parse_args()
 
     from tgengine.core.dataset import load_dataset
@@ -85,6 +88,9 @@ def main():
             patience=args.patience,
             lr=args.lr,
             device=args.device,
+            use_amp=args.amp,
+            grad_clip=args.grad_clip,
+            warmup_steps=args.warmup_steps,
         ),
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
 import os
 from typing import Any, Optional
 
@@ -35,6 +36,10 @@ class TrainConfig:
     seed: int = 42
     async_pipeline: bool = False   # prefetch batch i+1 while computing batch i
     checkpoint_dir: Optional[str] = None  # if set, auto-save best checkpoint here
+    use_amp: bool = False  # enable mixed precision (fp16) training
+    grad_clip: float = 1.0  # max gradient norm (0 to disable)
+    compile_model: bool = False  # torch.compile() the model forward pass
+    warmup_steps: int = 0  # linear warmup steps (0 to disable scheduler)
 
 
 class EvalProtocol(ABC):
@@ -374,8 +379,24 @@ class Engine:
         graph.freeze_csr()
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
+        self.scheduler = self._build_scheduler() if config.warmup_steps > 0 else None
+        if config.compile_model:
+            self.model = torch.compile(self.model)
         self._current_epoch = 0
         self._best_val = 0.0
+
+    def _build_scheduler(self):
+        total_steps = self.config.epochs * len(self.train_batches)
+        warmup = self.config.warmup_steps
+
+        def lr_lambda(step):
+            if step < warmup:
+                return step / max(1, warmup)
+            progress = (step - warmup) / max(1, total_steps - warmup)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def save_checkpoint(self, path: str) -> None:
         """Save full training state to a checkpoint file.
@@ -385,6 +406,7 @@ class Engine:
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "epoch": self._current_epoch,
             "best_val": self._best_val,
             "config": self.config,
@@ -400,6 +422,8 @@ class Engine:
         checkpoint = torch.load(path, map_location=self.config.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         self._current_epoch = checkpoint["epoch"]
         self._best_val = checkpoint["best_val"]
         return self._current_epoch
@@ -455,6 +479,7 @@ class Engine:
 
     def _train_epoch_sync(self) -> float:
         total_loss = 0.0
+        amp_enabled = self.config.use_amp
         for raw_batch in tqdm(self.train_batches, desc="Training"):
             neg = self.neg_strategy.sample(
                 raw_batch.src, raw_batch.dst, raw_batch.time, self.graph,
@@ -463,9 +488,16 @@ class Engine:
             raw_batch.neg = neg
             prepared = self.pipeline.prepare(raw_batch)
             self.optimizer.zero_grad()
-            output = self.model(prepared)
-            output.loss.backward()
-            self.optimizer.step()
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                output = self.model(prepared)
+            self.scaler.scale(output.loss).backward()
+            if self.config.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            if self.scheduler is not None:
+                self.scheduler.step()
             total_loss += output.loss.item()
             self.model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
         return total_loss
@@ -475,6 +507,7 @@ class Engine:
         pipe = self.async_pipeline
         batches = self.train_batches
         total_loss = 0.0
+        amp_enabled = self.config.use_amp
 
         if not batches:
             return 0.0
@@ -486,9 +519,16 @@ class Engine:
             rb, prepared = pipe.get()
 
             self.optimizer.zero_grad()
-            output = self.model(prepared)
-            output.loss.backward()
-            self.optimizer.step()
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                output = self.model(prepared)
+            self.scaler.scale(output.loss).backward()
+            if self.config.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            if self.scheduler is not None:
+                self.scheduler.step()
             total_loss += output.loss.item()
 
             # Graph state advance not needed (CSR is static for training)
@@ -525,9 +565,10 @@ class Engine:
                               edge_indices=rb.edge_indices)
             prepped.append(rb)
 
-        metrics = self.eval_protocol.evaluate(
-            self.model, self.pipeline, prepped, self.graph
-        )
+        with torch.amp.autocast("cuda", enabled=self.config.use_amp):
+            metrics = self.eval_protocol.evaluate(
+                self.model, self.pipeline, prepped, self.graph
+            )
 
         self.graph.restore(graph_snap)
         self.model.thaw(model_state)
