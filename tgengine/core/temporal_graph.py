@@ -7,6 +7,11 @@ import torch
 from torch import Tensor
 
 from .batch import NeighborData
+from .kernels import (
+    HAS_CUDA_EXT, HAS_TRITON,
+    cuda_temporal_recent_k, cuda_temporal_recent_2hop, cuda_co_neighbor_count,
+    triton_temporal_recent_k,
+)
 
 
 @dataclass
@@ -50,9 +55,11 @@ class TemporalGraph:
         device: str | torch.device = "cuda",
         overflow_size: int = 64,
         buffer_size: int | None = None,
+        use_triton: bool = True,
     ):
         if buffer_size is not None:
             overflow_size = buffer_size
+        self._use_triton = use_triton and (HAS_CUDA_EXT or HAS_TRITON)
         self.num_nodes = num_nodes
         self.edge_feat_dim = edge_feat_dim
         self.device = torch.device(device)
@@ -176,6 +183,41 @@ class TemporalGraph:
         """Get most recent k neighbors before query time using searchsorted on CSR."""
         if not self._frozen:
             self.freeze_csr()
+
+        N = nodes.shape[0]
+        device = self.device
+
+        # Fused kernel fast path: only when no overflow, on CUDA, and non-empty
+        if self._use_triton and self._ov_ids is None and N > 0 and device.type == "cuda":
+            safe_nodes = nodes.clamp(min=0)
+            is_padding = nodes < 0
+            query_nodes = safe_nodes.masked_fill(is_padding, 0).to(torch.int64)
+            query_times = times.to(torch.float64)
+
+            if HAS_CUDA_EXT:
+                out_ids, out_times, out_feats, out_mask = cuda_temporal_recent_k(
+                    self._offsets, self._nbr_times, self._nbr_ids, self._nbr_feats,
+                    query_nodes, query_times, k,
+                )
+            else:
+                out_ids, out_times, out_feats, out_mask = triton_temporal_recent_k(
+                    self._offsets, self._nbr_times, self._nbr_ids, self._nbr_feats,
+                    query_nodes, query_times, k,
+                )
+            # Zero out padding node results
+            if is_padding.any():
+                pad_mask = is_padding.unsqueeze(1).expand_as(out_mask)
+                out_ids = out_ids.masked_fill(pad_mask, self.PADDING_ID)
+                out_times = out_times.masked_fill(pad_mask, 0.0)
+                out_feats = out_feats.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+                out_mask = out_mask & ~pad_mask
+
+            return NeighborData(
+                neighbor_ids=out_ids,
+                timestamps=out_times,
+                edge_feats=out_feats,
+                mask=out_mask,
+            )
 
         N = nodes.shape[0]
         device = self.device
@@ -353,6 +395,57 @@ class TemporalGraph:
 
     def recent_2hop(self, nodes: Tensor, times: Tensor, k1: int, k2: int) -> NeighborData:
         """Get 1-hop and 2-hop neighbors for each query node."""
+        if not self._frozen:
+            self.freeze_csr()
+
+        N = nodes.shape[0]
+
+        # CUDA fused 2-hop path
+        if (self._use_triton and HAS_CUDA_EXT and self._ov_ids is None
+                and N > 0 and self.device.type == "cuda"):
+            safe_nodes = nodes.clamp(min=0)
+            is_padding = nodes < 0
+            query_nodes = safe_nodes.masked_fill(is_padding, 0).to(torch.int64)
+            query_times = times.to(torch.float64)
+
+            (h1_ids, h1_times, h1_feats, h1_mask,
+             h2_ids, h2_times, h2_feats, h2_mask) = cuda_temporal_recent_2hop(
+                self._offsets, self._nbr_times, self._nbr_ids, self._nbr_feats,
+                query_nodes, query_times, k1, k2,
+            )
+
+            # Zero out padding nodes
+            if is_padding.any():
+                pad1 = is_padding.unsqueeze(1).expand_as(h1_mask)
+                h1_ids = h1_ids.masked_fill(pad1, self.PADDING_ID)
+                h1_times = h1_times.masked_fill(pad1, 0.0)
+                h1_feats = h1_feats.masked_fill(pad1.unsqueeze(-1), 0.0)
+                h1_mask = h1_mask & ~pad1
+
+                pad2 = is_padding.unsqueeze(1).unsqueeze(2).expand_as(h2_mask)
+                h2_ids = h2_ids.masked_fill(pad2, self.PADDING_ID)
+                h2_times = h2_times.masked_fill(pad2, 0.0)
+                h2_feats = h2_feats.masked_fill(pad2.unsqueeze(-1), 0.0)
+                h2_mask = h2_mask & ~pad2
+
+            # Mask hop2 by hop1 validity
+            hop1_valid = h1_mask.unsqueeze(-1)
+            h2_mask = h2_mask & hop1_valid
+            h2_ids = h2_ids.masked_fill(~h2_mask, self.PADDING_ID)
+            h2_times = h2_times.masked_fill(~h2_mask, 0.0)
+            h2_feats = h2_feats.masked_fill(~h2_mask.unsqueeze(-1), 0.0)
+
+            hop1 = NeighborData(
+                neighbor_ids=h1_ids, timestamps=h1_times,
+                edge_feats=h1_feats, mask=h1_mask,
+            )
+            hop1.hop2_ids = h2_ids
+            hop1.hop2_times = h2_times
+            hop1.hop2_feats = h2_feats
+            hop1.hop2_mask = h2_mask
+            return hop1
+
+        # Fallback: two separate recent() calls
         hop1 = self.recent(nodes, times, k1)
 
         N, K1 = hop1.neighbor_ids.shape
@@ -380,6 +473,18 @@ class TemporalGraph:
 
     def co_neighbors(self, src: Tensor, dst: Tensor, times: Tensor, k: int = 32) -> Tensor:
         """Compute co-occurrence counts between src and dst neighbor sets."""
+        if not self._frozen:
+            self.freeze_csr()
+
+        # CUDA fast path
+        if (self._use_triton and HAS_CUDA_EXT and self._ov_ids is None
+                and src.shape[0] > 0 and self.device.type == "cuda"):
+            return cuda_co_neighbor_count(
+                self._offsets, self._nbr_times, self._nbr_ids,
+                src, dst, times, k,
+            )
+
+        # Fallback
         B = src.shape[0]
         all_nbrs = self.recent(torch.cat([src, dst]), torch.cat([times, times]), k)
         src_ids = all_nbrs.neighbor_ids[:B]

@@ -70,6 +70,7 @@ class _CoOccurrenceEncoder(nn.Module):
 
     def _count_broadcast(self, a_ids: Tensor, b_ids: Tensor) -> Tuple[Tensor, Tensor]:
         """O(K²) broadcast — fast for small K."""
+
         a_pad = a_ids == PADDING_ID
         b_pad = b_ids == PADDING_ID
 
