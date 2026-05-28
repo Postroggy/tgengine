@@ -55,6 +55,8 @@ Dataset (csv/npy) → TemporalGraph (GPU circular buffer)
 
 - `APEval`: 标准 Average Precision (1 pos + 1 neg)
 - `ThreeWayEval`: random + historical + inductive 三路
+
+**⚠️ Eval 协议注意事项**: DyGLib 及多数 CTDG 论文在 eval 时使用 `full_neighbor_sampler`（预加载全部 train+val+test 边），导致 eval 时模型能看到比训练时更多的邻居。实测这一做法使 AP 虚高约 8pp。TGEngine 当前 `Engine._evaluate()` 复现了这一行为以对齐论文数字。详见 memory 中的 `project_eval_protocol_leakage.md`。
 - `MRREval`: TGB 固定负样本列表 + ranking
 - MRR 优化：批内负样本去重，只 encode unique nodes
 

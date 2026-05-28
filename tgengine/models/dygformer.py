@@ -37,12 +37,12 @@ class _CoOccurrenceEncoder(nn.Module):
     where self_count = times this neighbor appears in a's list,
           cross_count = times this neighbor appears in b's list.
 
-    Both features are independently projected then summed.
+    Uses O(K) scatter_add approach instead of O(K²) broadcast when K > threshold.
     """
 
-    def __init__(self, d_out: int):
+    def __init__(self, d_out: int, num_nodes: int = 0):
         super().__init__()
-        # Applied per-scalar → (B, K, 2, d_out) then summed over dim 2
+        self.num_nodes = num_nodes
         self.proj = nn.Sequential(
             nn.Linear(1, d_out),
             nn.ReLU(),
@@ -58,31 +58,72 @@ class _CoOccurrenceEncoder(nn.Module):
         Returns:
             a_feat, b_feat — each (B, K, d_out) per-neighbor co-occurrence features.
         """
-        a_pad = a_ids == PADDING_ID   # (B, K)
+        K = a_ids.shape[1]
+        if K <= 64 or self.num_nodes == 0:
+            a_freq, b_freq = self._count_broadcast(a_ids, b_ids)
+        else:
+            a_freq, b_freq = self._count_scatter(a_ids, b_ids)
+
+        a_feat = self.proj(a_freq.unsqueeze(-1)).sum(dim=2)
+        b_feat = self.proj(b_freq.unsqueeze(-1)).sum(dim=2)
+        return a_feat, b_feat
+
+    def _count_broadcast(self, a_ids: Tensor, b_ids: Tensor) -> Tuple[Tensor, Tensor]:
+        """O(K²) broadcast — fast for small K."""
+        a_pad = a_ids == PADDING_ID
         b_pad = b_ids == PADDING_ID
 
-        # self-co-occurrence: mask padding so -1 doesn't spuriously match -1
-        a_self = (a_ids.unsqueeze(1) == a_ids.unsqueeze(2)).float()   # (B, K, K)
+        a_self = (a_ids.unsqueeze(1) == a_ids.unsqueeze(2)).float()
         b_self = (b_ids.unsqueeze(1) == b_ids.unsqueeze(2)).float()
-        cross = (a_ids.unsqueeze(1) == b_ids.unsqueeze(2)).float()    # (B, K, K)
+        cross = (a_ids.unsqueeze(1) == b_ids.unsqueeze(2)).float()
 
         a_self = a_self.masked_fill(a_pad.unsqueeze(2) | a_pad.unsqueeze(1), 0.0)
         b_self = b_self.masked_fill(b_pad.unsqueeze(2) | b_pad.unsqueeze(1), 0.0)
         cross = cross.masked_fill(a_pad.unsqueeze(2) | b_pad.unsqueeze(1), 0.0)
 
-        # Per-neighbor 2D features matching DyGLib semantics:
-        #   a_freq[b,j] = [count(a[b,j] in a[b]),  count(a[b,j] in b[b])]
-        #   b_freq[b,j] = [count(b[b,j] in a[b]),  count(b[b,j] in b[b])]
-        # cross[b,i,j] = (a[b,i]==b[b,j])
-        #   cross.sum(2)[b,i] = count of a[b,i] in b[b]  → used for a_freq second column
-        #   cross.sum(1)[b,j] = count of b[b,j] in a[b]  → used for b_freq first column
-        a_freq = torch.stack([a_self.sum(1), cross.sum(2)], dim=2)    # (B, K, 2)
-        b_freq = torch.stack([cross.sum(1), b_self.sum(1)], dim=2)    # (B, K, 2)
+        a_freq = torch.stack([a_self.sum(1), cross.sum(2)], dim=2)
+        b_freq = torch.stack([cross.sum(1), b_self.sum(1)], dim=2)
+        return a_freq, b_freq
 
-        # Project each scalar independently, sum; then zero padding positions (bias leak)
-        a_feat = self.proj(a_freq.unsqueeze(-1)).sum(dim=2)            # (B, K, d_out)
-        b_feat = self.proj(b_freq.unsqueeze(-1)).sum(dim=2)
-        return a_feat, b_feat
+    def _count_scatter(self, a_ids: Tensor, b_ids: Tensor) -> Tuple[Tensor, Tensor]:
+        """O(K) scatter — avoids (B,K,K) tensors for large K."""
+        B, K = a_ids.shape
+        device = a_ids.device
+        N = self.num_nodes + 2  # +2: slot 0 for padding bin, slots 1..num_nodes+1 for real IDs
+
+        a_pad = a_ids == PADDING_ID
+        b_pad = b_ids == PADDING_ID
+
+        a_sh = (a_ids + 1).long()
+        b_sh = (b_ids + 1).long()
+        a_sh[a_pad] = 0
+        b_sh[b_pad] = 0
+
+        # Self counts
+        a_tab = torch.zeros(B, N, device=device)
+        a_tab.scatter_add_(1, a_sh, (~a_pad).float())
+        a_self = a_tab.gather(1, a_sh)
+        a_self[a_pad] = 0
+
+        b_tab = torch.zeros(B, N, device=device)
+        b_tab.scatter_add_(1, b_sh, (~b_pad).float())
+        b_self = b_tab.gather(1, b_sh)
+        b_self[b_pad] = 0
+
+        # Cross: scatter a-values weighted by (~b_pad), gather at b-values
+        a_cross_tab = torch.zeros(B, N, device=device)
+        a_cross_tab.scatter_add_(1, a_sh, (~b_pad).float())
+        a_cross = a_cross_tab.gather(1, b_sh)
+        a_cross[a_pad] = 0
+
+        b_cross_tab = torch.zeros(B, N, device=device)
+        b_cross_tab.scatter_add_(1, b_sh, (~a_pad).float())
+        b_cross = b_cross_tab.gather(1, a_sh)
+        b_cross[b_pad] = 0
+
+        a_freq = torch.stack([a_self, a_cross], dim=2)
+        b_freq = torch.stack([b_cross, b_self], dim=2)
+        return a_freq, b_freq
 
 
 class _TransformerLayer(nn.Module):
@@ -143,6 +184,7 @@ class DyGFormer(TemporalModel):
         n_heads: int = 2,
         dropout: float = 0.1,
         node_feat: Optional[Tensor] = None,
+        num_nodes: int = 0,
     ):
         super().__init__()
         self.K = K
@@ -163,7 +205,7 @@ class DyGFormer(TemporalModel):
 
         # Fixed cosine time encoding matches DyGLib exactly (1/10^linspace(0,9,d))
         self.time_enc = FixedCosineTimeEncoder(d_time)
-        self.co_enc = _CoOccurrenceEncoder(d_channel)
+        self.co_enc = _CoOccurrenceEncoder(d_channel, num_nodes=num_nodes)
 
         # Channel projections (patch_size tokens concatenated → d_channel)
         self.proj_edge = nn.Linear(patch_size * d_edge, d_channel)

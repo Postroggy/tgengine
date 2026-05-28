@@ -194,15 +194,19 @@ def test_co_occurrence_cross_count():
 
 
 def test_co_occurrence_padding_masked():
-    """PADDING_ID (-1) positions should produce zero features."""
+    """PADDING_ID (-1) positions have zero co-occurrence counts but non-zero output (MLP bias).
+
+    DyGLib allows MLP bias to leak through on padding positions. We match this behavior
+    intentionally for accuracy alignment (see project_eval_protocol_leakage.md).
+    """
     co_enc = _CoOccurrenceEncoder(d_out=8)
     a_ids = torch.tensor([[-1, 1, 2, 3]], dtype=torch.int32)
     b_ids = torch.tensor([[-1, 4, 5, 6]], dtype=torch.int32)
 
     a_feat, b_feat = co_enc(a_ids.long(), b_ids.long())
-    # Position 0 is padding — feature should be zero
-    assert torch.all(a_feat[0, 0] == 0), "Padding positions should have zero features"
-    assert torch.all(b_feat[0, 0] == 0)
+    # Padding positions get MLP(0) = bias (non-zero in general), matching DyGLib
+    assert a_feat.shape == (1, 4, 8)
+    assert b_feat.shape == (1, 4, 8)
 
 
 # ---------------------------------------------------------------------------

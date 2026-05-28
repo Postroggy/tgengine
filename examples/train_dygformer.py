@@ -64,6 +64,7 @@ def main():
         d_time=100, d_channel=50,
         K=K, n_layers=2, patch_size=2,
         node_feat=node_feat,
+        num_nodes=ds.num_nodes,
     )
     print(f"  {sum(p.numel() for p in model.parameters()):,} params, K={K}")
 
