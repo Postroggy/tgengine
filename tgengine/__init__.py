@@ -20,9 +20,11 @@ from .pipeline.negatives import (
     FixedNegative,
     HistoricalNegative,
     HistoricalNegPool,
+    InBatchNegative,
     InductiveNegative,
     NegativeStrategy,
     RandomNegative,
+    VectorizedHistoricalNegative,
 )
 
 __all__ = [
@@ -57,7 +59,9 @@ __all__ = [
     "FixedNegative",
     "HistoricalNegative",
     "HistoricalNegPool",
+    "InBatchNegative",
     "InductiveNegative",
     "NegativeStrategy",
     "RandomNegative",
+    "VectorizedHistoricalNegative",
 ]

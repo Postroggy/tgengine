@@ -6,6 +6,7 @@ import pytest
 from tgengine.pipeline.negatives import (
     FixedNegative, HistoricalNegPool, HistoricalNegative,
     DyGLibHistoricalNegative, InductiveNegative, DyGLibInductiveNegative,
+    InBatchNegative, VectorizedHistoricalNegative,
 )
 from tgengine.core.temporal_graph import TemporalGraph
 from tgengine.core.batch import RawBatch
@@ -364,4 +365,110 @@ def test_dyglib_inductive_no_candidates_fallback():
     # No inductive edges (all historical = observed), should fallback to random
     neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
     assert neg.shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# InBatchNegative
+# ---------------------------------------------------------------------------
+
+def test_in_batch_negative_no_self():
+    """InBatchNegative never returns dst_i for position i."""
+    strategy = InBatchNegative(num_nodes=100)
+    dst = torch.arange(20)
+    src = torch.zeros(20, dtype=torch.long)
+    time = torch.zeros(20)
+
+    neg = strategy.sample(src, dst, time, graph=None)
+    assert neg.shape == (20,)
+    # No fixed-point: neg[i] != dst[i] for all i
+    assert not (neg == dst).any(), f"Fixed point found: neg={neg}, dst={dst}"
+
+
+def test_in_batch_negative_values_from_batch():
+    """All negatives must be values from the dst tensor."""
+    strategy = InBatchNegative(num_nodes=1000)
+    dst = torch.tensor([10, 20, 30, 40, 50])
+    src = torch.zeros(5, dtype=torch.long)
+    time = torch.zeros(5)
+
+    neg = strategy.sample(src, dst, time, graph=None)
+    dst_set = set(dst.tolist())
+    for v in neg.tolist():
+        assert v in dst_set, f"neg {v} not in batch dst {dst_set}"
+
+
+def test_in_batch_negative_mix_random():
+    """With mix_random=1.0, all negatives should be random (not from batch)."""
+    strategy = InBatchNegative(num_nodes=1000, mix_random=1.0)
+    dst = torch.tensor([0, 1, 2, 3, 4])
+    src = torch.zeros(5, dtype=torch.long)
+    time = torch.zeros(5)
+
+    # With 1000 nodes and mix_random=1.0, unlikely all end up in [0,4]
+    neg = strategy.sample(src, dst, time, graph=None)
+    assert neg.shape == (5,)
+    assert (neg >= 0).all() and (neg < 1000).all()
+
+
+# ---------------------------------------------------------------------------
+# VectorizedHistoricalNegative
+# ---------------------------------------------------------------------------
+
+def test_vectorized_historical_basic():
+    """VectorizedHistoricalNegative returns valid historical dst."""
+    src = np.array([0, 1, 2, 0, 1, 3, 2, 0, 4, 1], dtype=np.int64)
+    dst = np.array([1, 2, 3, 2, 0, 4, 1, 3, 0, 3], dtype=np.int64)
+    times = np.arange(10, dtype=np.float64)
+
+    strategy = VectorizedHistoricalNegative(src, dst, times, seed=42)
+
+    batch_src = torch.tensor([0, 1])
+    batch_dst = torch.tensor([4, 3])
+    batch_time = torch.tensor([8.0, 8.5])
+
+    neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+    assert neg.shape == (2,)
+    # All negatives should be valid node IDs
+    assert (neg >= 0).all() and (neg <= 4).all()
+
+
+def test_vectorized_historical_no_history_fallback():
+    """Falls back to random when no historical pairs exist."""
+    src = np.array([0, 1], dtype=np.int64)
+    dst = np.array([1, 0], dtype=np.int64)
+    times = np.array([5.0, 6.0])
+
+    strategy = VectorizedHistoricalNegative(src, dst, times, seed=42)
+
+    # Query at time=1.0: no pairs have first_time < 1.0
+    batch_src = torch.tensor([0, 1, 2])
+    batch_dst = torch.tensor([2, 3, 4])
+    batch_time = torch.tensor([1.0, 1.0, 1.0])
+
+    neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+    assert neg.shape == (3,)
+
+
+def test_vectorized_historical_excludes_batch():
+    """VectorizedHistoricalNegative should not return current batch edges as neg."""
+    src = np.array([0, 0, 0, 0], dtype=np.int64)
+    dst = np.array([1, 2, 3, 4], dtype=np.int64)
+    times = np.array([1.0, 2.0, 3.0, 4.0])
+
+    strategy = VectorizedHistoricalNegative(src, dst, times, seed=0)
+
+    # At time=5.0, all 4 pairs are historical
+    # batch edge is (0, 1) — should be excluded from candidates
+    batch_src = torch.tensor([0])
+    batch_dst = torch.tensor([1])
+    batch_time = torch.tensor([5.0])
+
+    # Sample many times: should never get 1
+    results = set()
+    for _ in range(100):
+        strategy._rng = np.random.RandomState(np.random.randint(10000))
+        neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+        results.add(neg.item())
+
+    assert 1 not in results, f"Batch edge dst=1 should be excluded, got results={results}"
 

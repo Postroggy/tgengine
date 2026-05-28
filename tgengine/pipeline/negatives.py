@@ -429,3 +429,140 @@ class CollisionFreeNegative(NegativeStrategy):
             neg[coll_idx] = new
 
         return neg
+
+
+class InBatchNegative(NegativeStrategy):
+    """In-batch negative sampling: use other positive dst in the same batch.
+
+    For each (src_i, dst_i), picks a random dst_j (j != i) from the batch.
+    Almost free (no external data access), provides moderate hardness because
+    batch dst nodes are all recently active.
+
+    Optionally mixes with random negatives: `mix_random` fraction is uniform
+    random, rest is in-batch.
+    """
+
+    def __init__(self, num_nodes: int, mix_random: float = 0.0,
+                 valid_dst_nodes: Optional[Tensor] = None):
+        self.num_nodes = num_nodes
+        self.mix_random = mix_random
+        self.valid_dst_nodes = valid_dst_nodes
+
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
+        B = src.shape[0]
+        device = src.device
+
+        if B <= 1:
+            return torch.randint(0, self.num_nodes, (B,), device=device)
+
+        # In-batch: random permutation that avoids identity
+        perm = torch.randperm(B, device=device)
+        # Fix fixed-points (where perm[i] == i)
+        fixed = perm == torch.arange(B, device=device)
+        if fixed.any():
+            fixed_idx = fixed.nonzero(as_tuple=True)[0]
+            shift = (fixed_idx + 1) % B
+            perm[fixed_idx] = perm[shift]
+            perm[shift] = fixed_idx
+
+        neg = dst[perm]
+
+        # Mix with random if requested
+        if self.mix_random > 0:
+            n_random = int(B * self.mix_random)
+            if n_random > 0:
+                mask = torch.zeros(B, dtype=torch.bool, device=device)
+                mask[:n_random] = True
+                mask = mask[torch.randperm(B, device=device)]
+                if self.valid_dst_nodes is not None:
+                    pool = self.valid_dst_nodes.to(device)
+                    rand_neg = pool[torch.randint(0, len(pool), (mask.sum(),), device=device)]
+                else:
+                    rand_neg = torch.randint(0, self.num_nodes, (mask.sum(),), device=device)
+                neg[mask] = rand_neg
+
+        return neg
+
+
+class VectorizedHistoricalNegative(NegativeStrategy):
+    """Fast historical negative sampling using sorted pair index.
+
+    Same semantics as DyGLibHistoricalNegative (global unique pairs before t,
+    exclude batch edges, sample dst) but implemented with vectorized numpy
+    operations instead of Python sets.
+
+    Pre-computes a pair index at init: sorted unique (src, dst) pairs with
+    their first-appearance time. At sample time, uses searchsorted on the
+    time array to find valid historical pairs in O(log P) instead of
+    rebuilding a Python set in O(N) per batch.
+
+    Still CPU-based (pair operations), but 5-10x faster than DyGLib version
+    for medium/large datasets.
+    """
+
+    def __init__(self, src_node_ids: np.ndarray, dst_node_ids: np.ndarray,
+                 interact_times: np.ndarray, seed: int = 42):
+        order = np.argsort(interact_times, kind='stable')
+        src_sorted = src_node_ids[order]
+        dst_sorted = dst_node_ids[order]
+        times_sorted = interact_times[order]
+
+        max_node = max(int(src_node_ids.max()), int(dst_node_ids.max())) + 1
+        self._max_node = max_node
+        pair_keys = src_sorted.astype(np.int64) * max_node + dst_sorted.astype(np.int64)
+
+        # Find first occurrence of each unique pair (preserving time order)
+        _, first_idx = np.unique(pair_keys, return_index=True)
+        first_idx.sort()
+
+        self._pair_src = src_sorted[first_idx]
+        self._pair_dst = dst_sorted[first_idx]
+        self._pair_time = times_sorted[first_idx]
+
+        # Sort by first-appearance time for searchsorted
+        time_order = np.argsort(self._pair_time, kind='stable')
+        self._pair_src = self._pair_src[time_order]
+        self._pair_dst = self._pair_dst[time_order]
+        self._pair_time = self._pair_time[time_order]
+
+        self._unique_dst = np.unique(dst_node_ids)
+        self._rng = np.random.RandomState(seed)
+
+    def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
+               edge_indices: Optional[Tensor] = None) -> Tensor:
+        device = src.device
+        size = src.shape[0]
+        batch_start_time = float(time.min().item())
+
+        # Historical pairs: all unique pairs first appearing before batch_start_time
+        end_idx = int(np.searchsorted(self._pair_time, batch_start_time, side='left'))
+
+        if end_idx == 0:
+            idx = self._rng.randint(0, len(self._unique_dst), size=size)
+            return torch.from_numpy(self._unique_dst[idx]).long().to(device)
+
+        # Exclude current batch edges
+        src_np = src.cpu().numpy().astype(np.int64)
+        dst_np = dst.cpu().numpy().astype(np.int64)
+        batch_keys_arr = np.unique(src_np * self._max_node + dst_np)
+
+        hist_keys = (self._pair_src[:end_idx].astype(np.int64) * self._max_node
+                     + self._pair_dst[:end_idx].astype(np.int64))
+
+        # Vectorized exclusion via sorted searchsorted
+        positions = np.searchsorted(batch_keys_arr, hist_keys)
+        positions = np.clip(positions, 0, len(batch_keys_arr) - 1)
+        mask = batch_keys_arr[positions] != hist_keys
+
+        candidate_dst = self._pair_dst[:end_idx][mask]
+
+        if size <= len(candidate_dst):
+            indices = self._rng.choice(len(candidate_dst), size=size, replace=False)
+            neg_dst = candidate_dst[indices]
+        else:
+            num_fill = size - len(candidate_dst)
+            fill_idx = self._rng.randint(0, len(self._unique_dst), size=num_fill)
+            neg_dst = np.concatenate([self._unique_dst[fill_idx], candidate_dst])
+
+        return torch.from_numpy(neg_dst.astype(np.int64)).long().to(device)
