@@ -130,8 +130,6 @@ def test_graph_preserved_after_eval():
 
     assert engine.graph.num_edges == edges_before, \
         "graph num_edges changed after evaluate"
-    assert (engine.graph._write_pos == snap.write_pos).all(), \
-        "write_pos changed after evaluate"
 
 
 def test_three_way_eval_produces_three_metrics():

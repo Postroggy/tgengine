@@ -108,6 +108,7 @@ class AsyncDataPipeline:
                         src=raw_batch.src, dst=raw_batch.dst, time=raw_batch.time,
                         edge_feat=raw_batch.edge_feat, neg=neg,
                         edge_indices=raw_batch.edge_indices,
+                        neg_src=raw_batch.neg_src,
                     )
                     prepared = pipeline.prepare(rb)
                     self._result = (rb, prepared)

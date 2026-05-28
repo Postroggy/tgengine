@@ -50,6 +50,9 @@ class DataPipeline:
             neg_flat = raw_batch.neg.reshape(-1) if raw_batch.neg.ndim > 1 else raw_batch.neg
             node_groups.append(neg_flat)
             group_sizes.append(neg_flat.shape[0])
+        if "neg" in self.spec.neighbors.for_nodes and raw_batch.neg_src is not None:
+            node_groups.append(raw_batch.neg_src)
+            group_sizes.append(raw_batch.neg_src.shape[0])
 
         all_nodes = torch.cat(node_groups)
         times_list = []
@@ -62,6 +65,8 @@ class DataPipeline:
                 times_list.append(raw_batch.time.unsqueeze(1).expand_as(raw_batch.neg).reshape(-1))
             else:
                 times_list.append(raw_batch.time)
+        if "neg" in self.spec.neighbors.for_nodes and raw_batch.neg_src is not None:
+            times_list.append(raw_batch.time)
         all_times = torch.cat(times_list)
 
         # ---- 1-hop -------------------------------------------------------
@@ -92,7 +97,7 @@ class DataPipeline:
             return nd
 
         idx = 0
-        src_nbrs = dst_nbrs = neg_nbrs = None
+        src_nbrs = dst_nbrs = neg_nbrs = neg_src_nbrs = None
 
         if "src" in self.spec.neighbors.for_nodes:
             src_nbrs = _build_nbr(idx)
@@ -102,6 +107,9 @@ class DataPipeline:
             idx += 1
         if "neg" in self.spec.neighbors.for_nodes and raw_batch.neg is not None:
             neg_nbrs = _build_nbr(idx)
+            idx += 1
+        if "neg" in self.spec.neighbors.for_nodes and raw_batch.neg_src is not None:
+            neg_src_nbrs = _build_nbr(idx)
             idx += 1
 
         co_occur = None
@@ -119,6 +127,8 @@ class DataPipeline:
             src_neighbors=src_nbrs,
             dst_neighbors=dst_nbrs,
             neg_neighbors=neg_nbrs,
+            neg_src_neighbors=neg_src_nbrs,
+            neg_src=raw_batch.neg_src,
             co_occurrence=co_occur,
         )
 

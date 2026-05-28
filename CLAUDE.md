@@ -172,3 +172,46 @@ ssh scnu 'bash -l -c "cd ~/CodeBase/Graph/tgengine && conda run -n PyGBase pytho
 - 数据集路径：`/mnt/home/gyq/CodeBase/Graph/DG_Data`
 - conda 环境：`PyGBase`（PyTorch 2.10.0+cu128，CUDA 可用）
 - 首次部署需 `conda run -n PyGBase pip install -e .`
+
+## 远程训练（长时间 GPU 任务）
+
+不要让 Claude Code 直接持有 SSH 前台训练进程。使用 tmux + 日志文件模式：
+
+```bash
+# 1. 同步代码
+rsync -av --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' --exclude='*.egg-info' \
+    /Users/xg/Coding/PersonalFile/tgengine/ scnu:~/CodeBase/Graph/tgengine/
+
+# 2. 写训练脚本到远端（解决 tmux 内 conda 环境加载问题）
+ssh scnu 'cat > /tmp/run_train.sh << "EOF"
+#!/bin/bash
+export PATH="/mnt/home/gyq/miniconda3/bin:$PATH"
+eval "$(/mnt/home/gyq/miniconda3/bin/conda shell.bash hook)"
+conda activate PyGBase
+cd ~/CodeBase/Graph/tgengine
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONUNBUFFERED=1
+python -u examples/train_dygformer.py --dataset uci --epochs 100 --patience 20
+EOF
+chmod +x /tmp/run_train.sh'
+
+# 3. tmux 启动训练
+ssh scnu 'tmux kill-session -t train 2>/dev/null; rm -f /tmp/tgengine_train.log; \
+    tmux new-session -d -s train "/tmp/run_train.sh 2>&1 | tee /tmp/tgengine_train.log"'
+
+# 4. 查看日志
+ssh scnu 'tail -20 /tmp/tgengine_train.log'
+
+# 5. 等待完成（用 Monitor 工具监控关键输出）
+# Monitor: until ssh scnu 'grep -q "Best test AP" /tmp/tgengine_train.log'; do sleep 30; done
+```
+
+关键点：
+- tmux 内必须显式初始化 conda（`eval "$(conda shell.bash hook)"` + `conda activate`）
+- 用 `PYTHONUNBUFFERED=1` + `python -u` 确保实时输出
+- 用 `tee` 同时输出到 terminal 和日志文件
+- 查看进度用 `tail`，不要持有长连接
+
+## 进度跟踪
+
+每次对话有实质性进展时（修复 bug、完成功能、跑出实验结果），必须更新 memory 中的 progress 文件（`project_accuracy_alignment.md` 等），简短记录：做了什么、结果如何、下一步方向。防止开新对话时丢失上下文。

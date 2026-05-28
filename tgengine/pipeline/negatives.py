@@ -150,13 +150,25 @@ class NegativeStrategy(ABC):
 
 
 class RandomNegative(NegativeStrategy):
-    """Uniform random negative sampling. O(1), GPU-native."""
+    """Uniform random negative sampling. O(1), GPU-native.
 
-    def __init__(self, num_nodes: int):
+    Args:
+        num_nodes: total node count (used as fallback when valid_dst_nodes is None).
+        valid_dst_nodes: optional 1-D LongTensor of valid dst node IDs.
+            When provided, negatives are sampled from this set instead of [0, num_nodes),
+            matching DyGLib's behavior of sampling only from dataset-occurring dst nodes.
+    """
+
+    def __init__(self, num_nodes: int, valid_dst_nodes: Optional[Tensor] = None):
         self.num_nodes = num_nodes
+        self.valid_dst_nodes = valid_dst_nodes
 
     def sample(self, src: Tensor, dst: Tensor, time: Tensor, graph: TemporalGraph,
                edge_indices: Optional[Tensor] = None) -> Tensor:
+        if self.valid_dst_nodes is not None:
+            nodes = self.valid_dst_nodes.to(src.device)
+            idx = torch.randint(0, len(nodes), (src.shape[0],), device=src.device)
+            return nodes[idx]
         return torch.randint(0, self.num_nodes, (src.shape[0],), device=src.device)
 
 

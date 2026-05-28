@@ -2,11 +2,18 @@
 
 Supports loading CTDG datasets from csv/npy files (DyGLib format)
 and TGB format, converting them into RawBatch streams.
+
+DyGLib-compatible data loading:
+  - Time-quantile splits (not index-based)
+  - Feature padding to 172 dimensions
+  - Transductive / inductive eval split
+  - Keeps zero-padding row at index 0 of feature matrices
 """
 
 from __future__ import annotations
 
 import pickle
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -17,12 +24,18 @@ from torch import Tensor
 
 from .batch import RawBatch
 
+PAD_FEAT_DIM = 172
+
 
 @dataclass
 class TemporalDataset:
-    """A loaded temporal graph dataset."""
+    """A loaded temporal graph dataset.
 
-    src: Tensor  # (N,) all source nodes, chronologically sorted
+    Edges are sorted chronologically within the training set, then
+    validation set, then test set (matching DyGLib's reordering).
+    """
+
+    src: Tensor  # (N,) all source nodes, chronologically sorted within each split
     dst: Tensor  # (N,) all destination nodes
     time: Tensor  # (N,) all timestamps
     edge_feat: Optional[Tensor]  # (N, d_edge) or None
@@ -31,9 +44,13 @@ class TemporalDataset:
     num_nodes: int
     num_edges: int
 
-    # Split indices
+    # Split boundaries: edges are ordered [train | val | test]
     train_end: int
     val_end: int
+
+    # Inductive eval masks (same length as full dataset, aligned to reordered edges)
+    new_node_val_mask: Optional[Tensor] = None   # bool (N,)
+    new_node_test_mask: Optional[Tensor] = None  # bool (N,)
 
     @property
     def edge_feat_dim(self) -> int:
@@ -43,8 +60,16 @@ class TemporalDataset:
     def node_feat_dim(self) -> int:
         return self.node_feat.shape[1] if self.node_feat is not None else 0
 
-    def get_batches(self, split: str, batch_size: int, device: str = "cuda") -> list[RawBatch]:
-        """Get chronological batches for a split."""
+    def get_batches(self, split: str, batch_size: int, device: str = "cuda",
+                    inductive_only: bool = False) -> list[RawBatch]:
+        """Get chronological batches for a split.
+
+        Args:
+            split: "train", "val", or "test".
+            batch_size: number of edges per batch.
+            device: target device.
+            inductive_only: if True, only return edges with new nodes (for inductive eval).
+        """
         if split == "train":
             start, end = 0, self.train_end
         elif split == "val":
@@ -54,14 +79,23 @@ class TemporalDataset:
         else:
             raise ValueError(f"Unknown split: {split}")
 
+        # Build index list, optionally filtered for inductive eval
+        if inductive_only and split == "val" and self.new_node_val_mask is not None:
+            idx = torch.where(self.new_node_val_mask[start:end])[0] + start
+        elif inductive_only and split == "test" and self.new_node_test_mask is not None:
+            idx = torch.where(self.new_node_test_mask[start:end])[0] + start
+        else:
+            idx = torch.arange(start, end)
+
         batches = []
-        for i in range(start, end, batch_size):
-            j = min(i + batch_size, end)
-            feat = self.edge_feat[i:j].to(device) if self.edge_feat is not None else None
+        for i in range(0, len(idx), batch_size):
+            j = min(i + batch_size, len(idx))
+            batch_idx = idx[i:j]
+            feat = self.edge_feat[batch_idx].to(device) if self.edge_feat is not None else None
             batches.append(RawBatch(
-                src=self.src[i:j].to(device),
-                dst=self.dst[i:j].to(device),
-                time=self.time[i:j].to(device),
+                src=self.src[batch_idx].to(device),
+                dst=self.dst[batch_idx].to(device),
+                time=self.time[batch_idx].to(device),
                 edge_feat=feat,
             ))
         return batches
@@ -73,67 +107,146 @@ def load_dataset(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
 ) -> TemporalDataset:
-    """Load a CTDG dataset from DyGLib-format files.
+    """Load a CTDG dataset with DyGLib-compatible preprocessing.
+
+    Features are zero-padded to 172 dimensions. Splits use time-quantile
+    thresholds. Random 10% of test-time nodes are held out for inductive eval.
 
     Expected files:
         {dataset_path}/{dataset_name}/ml_{dataset_name}.csv
         {dataset_path}/{dataset_name}/ml_{dataset_name}.npy (edge features)
         {dataset_path}/{dataset_name}/ml_{dataset_name}_node.npy (node features, optional)
-
-    Args:
-        dataset_name: Name of the dataset (e.g., "wikipedia", "reddit").
-        dataset_path: Root directory containing dataset folders.
-        val_ratio: Fraction of edges for validation.
-        test_ratio: Fraction of edges for test.
-
-    Returns:
-        TemporalDataset with all data loaded and splits computed.
     """
+    import pandas as pd
+
     base = Path(dataset_path) / dataset_name
 
-    # Load edge list
     csv_path = base / f"ml_{dataset_name}.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {csv_path}")
 
-    # CSV format: u, i, ts, label, idx
-    data = np.genfromtxt(csv_path, delimiter=",", skip_header=1)
-    src = torch.from_numpy(data[:, 0]).long()
-    dst = torch.from_numpy(data[:, 1]).long()
-    time = torch.from_numpy(data[:, 2]).double()
+    df = pd.read_csv(str(csv_path))
+    src = df["u"].values.astype(np.int64)
+    dst = df["i"].values.astype(np.int64)
+    time_vals = df["ts"].values.astype(np.float64)
+    labels = df["label"].values
 
-    # Edge features
-    feat_path = base / f"ml_{dataset_name}.npy"
-    edge_feat = None
-    if feat_path.exists():
-        edge_feat = torch.from_numpy(np.load(str(feat_path))).float()
-        # First row is often padding (index 0), skip it
-        if edge_feat.shape[0] == len(src) + 1:
-            edge_feat = edge_feat[1:]
-
-    # Node features
-    node_path = base / f"ml_{dataset_name}_node.npy"
+    # ---- feature loading & padding to 172 ----
     node_feat = None
+    node_path = base / f"ml_{dataset_name}_node.npy"
     if node_path.exists():
         node_feat = torch.from_numpy(np.load(str(node_path))).float()
+        if node_feat.shape[1] < PAD_FEAT_DIM:
+            pad = torch.zeros(node_feat.shape[0], PAD_FEAT_DIM - node_feat.shape[1])
+            node_feat = torch.cat([node_feat, pad], dim=1)
 
-    num_nodes = max(src.max(), dst.max()).item() + 1
+    edge_feat = None
+    feat_path = base / f"ml_{dataset_name}.npy"
+    if feat_path.exists():
+        edge_feat = torch.from_numpy(np.load(str(feat_path))).float()
+        if edge_feat.shape[1] < PAD_FEAT_DIM:
+            pad = torch.zeros(edge_feat.shape[0], PAD_FEAT_DIM - edge_feat.shape[1])
+            edge_feat = torch.cat([edge_feat, pad], dim=1)
+        # Keep zero-row at index 0 (DyGLib compatibility: 0 = padding sentinel)
+
+    num_nodes = max(src.max(), dst.max()) + 1
     num_edges = len(src)
 
-    # Chronological split
-    val_start = int(num_edges * (1 - val_ratio - test_ratio))
-    test_start = int(num_edges * (1 - test_ratio))
+    # ---- time-quantile splits ----
+    val_time, test_time = list(
+        np.quantile(time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)])
+    )
+
+    train_mask = time_vals <= val_time
+    val_mask = (time_vals > val_time) & (time_vals <= test_time)
+    test_mask = time_vals > test_time
+
+    # ---- inductive node sets (matching DyGLib) ----
+    random.seed(2020)
+    node_set = set(src) | set(dst)
+    num_total_unique = len(node_set)
+
+    # Nodes appearing at test time
+    test_node_set = set(src[time_vals > val_time]) | set(dst[time_vals > val_time])
+    # 10% of all unique nodes, sampled from test-time nodes, held out
+    new_test_node_set = set(
+        random.sample(list(test_node_set), int(0.1 * num_total_unique))
+    )
+
+    # Remove edges involving new_test_nodes from training
+    new_test_src = np.isin(src, list(new_test_node_set))
+    new_test_dst = np.isin(dst, list(new_test_node_set))
+    observed_mask = ~(new_test_src | new_test_dst)
+    train_mask = train_mask & observed_mask
+
+    # New nodes = nodes never seen in training
+    train_node_set = set(src[train_mask]) | set(dst[train_mask])
+    new_node_set = node_set - train_node_set
+
+    # Inductive eval masks: edges with at least one node from new_node_set
+    edge_contains_new = np.array([
+        (s in new_node_set or d in new_node_set)
+        for s, d in zip(src, dst)
+    ])
+    new_node_val_mask = val_mask & edge_contains_new
+    new_node_test_mask = test_mask & edge_contains_new
+
+    # ---- reorder: train first, then val, then test ----
+    order = np.concatenate([
+        np.where(train_mask)[0],
+        np.where(val_mask)[0],
+        np.where(test_mask)[0],
+    ])
+
+    src_t = torch.from_numpy(src[order]).long()
+    dst_t = torch.from_numpy(dst[order]).long()
+    time_t = torch.from_numpy(time_vals[order]).double()
+    edge_feat_t = edge_feat[order] if edge_feat is not None else None
+    new_node_val_t = torch.from_numpy(new_node_val_mask[order])
+    new_node_test_t = torch.from_numpy(new_node_test_mask[order])
+
+    train_end = int(train_mask.sum())
+    val_end = train_end + int(val_mask.sum())
+    num_edges = val_end + int(test_mask.sum())  # excludes train-time new-node edges
+
+    print(
+        f"The dataset has {num_edges} interactions, involving {num_total_unique} different nodes"
+    )
+    print(
+        f"The training dataset has {train_end} interactions, "
+        f"involving {len(train_node_set)} different nodes"
+    )
+    print(
+        f"The validation dataset has {val_mask.sum()} interactions, "
+        f"involving {len(set(src[val_mask]) | set(dst[val_mask]))} different nodes"
+    )
+    print(
+        f"The test dataset has {test_mask.sum()} interactions, "
+        f"involving {len(set(src[test_mask]) | set(dst[test_mask]))} different nodes"
+    )
+    print(
+        f"The new node validation dataset has {new_node_val_mask.sum()} interactions"
+    )
+    print(
+        f"The new node test dataset has {new_node_test_mask.sum()} interactions"
+    )
+    print(
+        f"{len(new_test_node_set)} nodes were used for the inductive testing, "
+        f"i.e. are never seen during training"
+    )
 
     return TemporalDataset(
-        src=src,
-        dst=dst,
-        time=time,
-        edge_feat=edge_feat,
+        src=src_t,
+        dst=dst_t,
+        time=time_t,
+        edge_feat=edge_feat_t,
         node_feat=node_feat,
         num_nodes=num_nodes,
         num_edges=num_edges,
-        train_end=val_start,
-        val_end=test_start,
+        train_end=train_end,
+        val_end=val_end,
+        new_node_val_mask=new_node_val_t,
+        new_node_test_mask=new_node_test_t,
     )
 
 

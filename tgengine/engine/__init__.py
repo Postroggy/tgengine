@@ -5,8 +5,10 @@ from dataclasses import dataclass
 import os
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import average_precision_score
 from torch import Tensor
 from tqdm import tqdm
 
@@ -50,15 +52,28 @@ class EvalProtocol(ABC):
 
 
 class APEval(EvalProtocol):
-    """Standard Average Precision evaluation (1 pos + 1 neg per edge)."""
+    """Standard Average Precision evaluation (1 pos + 1 neg per edge).
 
-    def evaluate(self, model, pipeline, eval_batches, graph):
+    When neg_strategy and graph are provided, negatives are sampled automatically.
+    Otherwise, the caller must set raw_batch.neg before passing batches in.
+    """
+
+    def evaluate(self, model, pipeline, eval_batches, graph, neg_strategy=None):
         model.eval()
         all_pos_scores = []
         all_neg_scores = []
 
         with torch.no_grad():
             for raw_batch in eval_batches:
+                if neg_strategy is not None and raw_batch.neg is None:
+                    neg = neg_strategy.sample(raw_batch.src, raw_batch.dst,
+                                              raw_batch.time, graph,
+                                              raw_batch.edge_indices)
+                    raw_batch = RawBatch(
+                        src=raw_batch.src, dst=raw_batch.dst,
+                        time=raw_batch.time, edge_feat=raw_batch.edge_feat,
+                        neg=neg, edge_indices=raw_batch.edge_indices,
+                    )
                 prepared = pipeline.prepare(raw_batch)
                 output = model(prepared)
                 all_pos_scores.append(output.pos_score)
@@ -67,8 +82,10 @@ class APEval(EvalProtocol):
 
         pos = torch.cat(all_pos_scores).sigmoid()
         neg = torch.cat(all_neg_scores).sigmoid()
-        # AP = fraction of times pos > neg
-        ap = (pos > neg).float().mean().item()
+        # sklearn average_precision_score, matching DyGLib evaluation
+        predicts = torch.cat([pos, neg]).cpu().numpy()
+        labels = np.concatenate([np.ones(len(pos)), np.zeros(len(neg))])
+        ap = float(average_precision_score(y_true=labels, y_score=predicts))
         return {"ap": ap}
 
 
@@ -119,7 +136,9 @@ class ThreeWayEval(EvalProtocol):
 
             pos = torch.cat(all_pos_scores).sigmoid()
             neg_scores = torch.cat(all_neg_scores).sigmoid()
-            results[f"ap_{name}"] = (pos > neg_scores).float().mean().item()
+            predicts = torch.cat([pos, neg_scores]).cpu().numpy()
+            labels = np.concatenate([np.ones(len(pos)), np.zeros(len(neg_scores))])
+            results[f"ap_{name}"] = float(average_precision_score(y_true=labels, y_score=predicts))
 
         return results
 
@@ -263,6 +282,11 @@ class Engine:
             if config.async_pipeline and config.device.startswith("cuda")
             else None
         )
+        # Preload all training edges into graph and freeze CSR
+        for rb in train_batches:
+            graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
+        graph.freeze_csr()
+
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
         self._current_epoch = 0
         self._best_val = 0.0
@@ -322,8 +346,10 @@ class Engine:
                 if self.config.checkpoint_dir is not None:
                     save_path = os.path.join(self.config.checkpoint_dir, "best.pt")
                     self.save_checkpoint(save_path)
+                print(f"  Epoch {epoch}: loss={train_loss:.4f} val={val_score:.4f} test={best_test} *")
             else:
                 patience_counter += 1
+                print(f"  Epoch {epoch}: loss={train_loss:.4f} val={val_score:.4f} patience={patience_counter}")
 
             if patience_counter >= self.config.patience:
                 break
@@ -355,7 +381,6 @@ class Engine:
             output.loss.backward()
             self.optimizer.step()
             total_loss += output.loss.item()
-            self.graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
             self.model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
         return total_loss
 
@@ -380,8 +405,7 @@ class Engine:
             self.optimizer.step()
             total_loss += output.loss.item()
 
-            # Graph and model state advance — MUST happen before next prefetch
-            self.graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
+            # Graph state advance not needed (CSR is static for training)
             self.model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
 
             if i + 1 < len(batches):
@@ -390,9 +414,19 @@ class Engine:
         return total_loss
 
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
-        """Run evaluation with proper snapshot/restore."""
+        """Run evaluation with proper snapshot/restore.
+
+        Preloads ALL val+test edges into graph before evaluation to match DyGLib's
+        full_neighbor_sampler semantics (eval sees all edges in the dataset).
+        """
         graph_snap = self.graph.snapshot()
         model_state = self.model.freeze()
+
+        # Preload all val+test edges so neighbor queries see full dataset (DyGLib semantics)
+        for rb in self.val_batches:
+            self.graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
+        for rb in self.test_batches:
+            self.graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
 
         # Ensure every eval batch has negatives sampled (use train neg strategy)
         prepped = []

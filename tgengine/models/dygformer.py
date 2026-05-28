@@ -82,8 +82,6 @@ class _CoOccurrenceEncoder(nn.Module):
         # Project each scalar independently, sum; then zero padding positions (bias leak)
         a_feat = self.proj(a_freq.unsqueeze(-1)).sum(dim=2)            # (B, K, d_out)
         b_feat = self.proj(b_freq.unsqueeze(-1)).sum(dim=2)
-        a_feat = a_feat.masked_fill(a_pad.unsqueeze(-1), 0.0)
-        b_feat = b_feat.masked_fill(b_pad.unsqueeze(-1), 0.0)
         return a_feat, b_feat
 
 
@@ -147,12 +145,14 @@ class DyGFormer(TemporalModel):
         node_feat: Optional[Tensor] = None,
     ):
         super().__init__()
-        if K % patch_size != 0:
-            raise ValueError(f"K={K} must be divisible by patch_size={patch_size}")
-
         self.K = K
         self.patch_size = patch_size
-        self.n_patches = K // patch_size
+
+        # Sequence = self + K neighbors. Pad to patch_size divisibility (matching DyGLib)
+        seq_len = K + 1
+        if seq_len % patch_size != 0:
+            seq_len += patch_size - seq_len % patch_size
+        self.n_patches = seq_len // patch_size
         self.d_channel = d_channel
 
         # Instance-level gather_spec so K propagates to DataPipeline
@@ -200,10 +200,12 @@ class DyGFormer(TemporalModel):
             batch.src_neighbors, batch.dst_neighbors, batch.time,
             batch.src, batch.dst,
         )
-        # Negative: encode (src, neg) jointly — src_emb is recomputed with neg context
+        # Negative: encode (neg_src, neg) jointly — uses random src when available
+        neg_src_nbrs = batch.neg_src_neighbors if batch.neg_src_neighbors is not None else batch.src_neighbors
+        neg_src_ids = batch.neg_src if batch.neg_src is not None else batch.src
         src_emb_neg, neg_emb = self._encode_pair(
-            batch.src_neighbors, batch.neg_neighbors, batch.time,
-            batch.src, batch.neg,
+            neg_src_nbrs, batch.neg_neighbors, batch.time,
+            neg_src_ids, batch.neg,
         )
 
         pos_score = self.decoder(torch.cat([src_emb, dst_emb], dim=-1)).squeeze(-1)
@@ -217,81 +219,89 @@ class DyGFormer(TemporalModel):
 
     def _encode_pair(
         self, a_nbrs: NeighborData, b_nbrs: NeighborData, time: Tensor,
-        a_ids: Optional[Tensor] = None, b_ids: Optional[Tensor] = None,
+        a_ids: Tensor, b_ids: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        """Encode a (node-a, node-b) pair jointly. Returns (a_emb, b_emb) (B, d_model)."""
-        # Time deltas
-        a_dt = time.unsqueeze(1).float() - a_nbrs.timestamps.float()  # (B, K)
+        """Encode a (node-a, node-b) pair jointly.
+
+        Self-token is integrated into the neighbor sequence at position 0
+        BEFORE patching, matching DyGLib's architecture exactly.
+        """
+        B, K, dev = a_nbrs.edge_feats.shape[0], self.K, a_nbrs.edge_feats.device
+
+        # ---- 1. Full neighbor-id sequences (self at position 0) ----
+        a_nbr_ids = a_nbrs.neighbor_ids.long()   # (B, K), -1 for padding
+        b_nbr_ids = b_nbrs.neighbor_ids.long()
+        a_full_ids = torch.cat([a_ids.long().unsqueeze(1), a_nbr_ids], dim=1)  # (B, 1+K)
+        b_full_ids = torch.cat([b_ids.long().unsqueeze(1), b_nbr_ids], dim=1)
+
+        # Full mask: self at position 0 always valid
+        ones = torch.ones(B, 1, dtype=torch.bool, device=dev)
+        a_mask = torch.cat([ones, a_nbrs.mask], dim=1)    # (B, 1+K)
+        b_mask = torch.cat([ones, b_nbrs.mask], dim=1)
+
+        # ---- 2. Time channel (dt=0 for self) ----
+        a_dt = time.unsqueeze(1).float() - a_nbrs.timestamps.float()   # (B, K)
         b_dt = time.unsqueeze(1).float() - b_nbrs.timestamps.float()
+        a_time_nbr = self.time_enc(a_dt)   # (B, K, d_time)
+        b_time_nbr = self.time_enc(b_dt)
+        a_time_nbr = a_time_nbr.masked_fill(~a_nbrs.mask.unsqueeze(-1), 0.0)
+        b_time_nbr = b_time_nbr.masked_fill(~b_nbrs.mask.unsqueeze(-1), 0.0)
+        t0 = self.time_enc(torch.zeros(B, 1, device=dev))              # (B, 1, d_time)
+        a_time = torch.cat([t0, a_time_nbr], dim=1)                    # (B, 1+K, d_time)
+        b_time = torch.cat([t0, b_time_nbr], dim=1)
 
-        # Per-neighbor time features
-        a_time = self.time_enc(a_dt)   # (B, K, d_time)
-        b_time = self.time_enc(b_dt)
+        # ---- 3. Edge channel (zeros for self, no edge to self) ----
+        d_edge = a_nbrs.edge_feats.shape[-1]
+        a_edge = torch.cat([
+            torch.zeros(B, 1, d_edge, device=dev), a_nbrs.edge_feats,
+        ], dim=1)   # (B, 1+K, d_edge)
+        b_edge = torch.cat([
+            torch.zeros(B, 1, d_edge, device=dev), b_nbrs.edge_feats,
+        ], dim=1)
 
-        # Per-neighbor co-occurrence features
-        a_co, b_co = self.co_enc(a_nbrs.neighbor_ids.long(), b_nbrs.neighbor_ids.long())  # (B,K,d_ch)
+        # ---- 4. Co-occurrence (self participates in counting) ----
+        a_co, b_co = self.co_enc(a_full_ids, b_full_ids)   # (B, 1+K, d_ch)
 
-        # Optional node features: look up static node embeddings by neighbor ID
+        # ---- 5. Node features channel (optional) ----
         a_node = b_node = None
         if self.node_feat is not None:
-            safe_a = a_nbrs.neighbor_ids.long().clamp(0, self.node_feat.shape[0] - 1)
-            safe_b = b_nbrs.neighbor_ids.long().clamp(0, self.node_feat.shape[0] - 1)
-            a_node = self.node_feat[safe_a].masked_fill(~a_nbrs.mask.unsqueeze(-1), 0.0)
-            b_node = self.node_feat[safe_b].masked_fill(~b_nbrs.mask.unsqueeze(-1), 0.0)
+            a_node = self.node_feat[a_full_ids.clamp(min=0)]
+            b_node = self.node_feat[b_full_ids.clamp(min=0)]
 
-        # Build patch tokens for each channel, then interleave channels
-        a_tok = self._build_token(a_nbrs.edge_feats, a_time, a_co, a_node)  # (B, n_patches, d_joint)
-        b_tok = self._build_token(b_nbrs.edge_feats, b_time, b_co, b_node)
+        # ---- 6. Pad to patch_size divisibility ----
+        S = 1 + K   # sequence length before padding
+        if S % self.patch_size != 0:
+            pad = self.patch_size - S % self.patch_size
+            a_edge = F.pad(a_edge, (0, 0, 0, pad))
+            b_edge = F.pad(b_edge, (0, 0, 0, pad))
+            a_time = F.pad(a_time, (0, 0, 0, pad))
+            b_time = F.pad(b_time, (0, 0, 0, pad))
+            a_co = F.pad(a_co, (0, 0, 0, pad))
+            b_co = F.pad(b_co, (0, 0, 0, pad))
+            a_mask = F.pad(a_mask, (0, pad), value=False)
+            b_mask = F.pad(b_mask, (0, pad), value=False)
+            if a_node is not None:
+                a_node = F.pad(a_node, (0, 0, 0, pad))
+                b_node = F.pad(b_node, (0, 0, 0, pad))
 
-        # Neighbor padding mask: (B, n_patches) True = valid
-        a_pmask = self._patch_padding_mask(a_nbrs.mask)
-        b_pmask = self._patch_padding_mask(b_nbrs.mask)
+        # ---- 7. Patchify + project each channel ----
+        a_tok = self._build_token(a_edge, a_time, a_co, a_node)  # (B, n_patches, d_joint)
+        b_tok = self._build_token(b_edge, b_time, b_co, b_node)
 
-        # Self-token: prepend query node at position 0 (DyGLib-style)
-        # Provides node's own LIWC features even when history is empty (key for sparse Wikipedia nodes)
-        if self.node_feat is not None and a_ids is not None and b_ids is not None:
-            a_self = self._self_token(a_ids, time)   # (B, 1, d_joint)
-            b_self = self._self_token(b_ids, time)
-            a_tok = torch.cat([a_self, a_tok], dim=1)
-            b_tok = torch.cat([b_self, b_tok], dim=1)
-            ones = torch.ones(a_tok.shape[0], 1, dtype=torch.bool, device=a_tok.device)
-            a_pmask = torch.cat([ones, a_pmask], dim=1)
-            b_pmask = torch.cat([ones, b_pmask], dim=1)
-
-        n_seq = a_tok.shape[1]
-        # Joint sequence: (B, 2*n_seq, d_joint)
-        joint = torch.cat([a_tok, b_tok], dim=1)
+        # ---- 8. Joint src+dst transformer ----
+        n_patches = a_tok.shape[1]
+        joint = torch.cat([a_tok, b_tok], dim=1)   # (B, 2*n_patches, d_joint)
         for layer in self.layers:
             joint = layer(joint)
 
-        a_out = joint[:, :n_seq, :]
-        b_out = joint[:, n_seq:, :]
+        a_out = joint[:, :n_patches, :]
+        b_out = joint[:, n_patches:, :]
 
-        # Simple mean over all patches (including padding), matching DyGLib
+        # Simple mean over all patches (matching DyGLib)
         a_emb = a_out.mean(dim=1)
         b_emb = b_out.mean(dim=1)
 
         return self.out_proj(a_emb), self.out_proj(b_emb)
-
-    def _self_token(self, ids: Tensor, time: Tensor) -> Tensor:
-        """Build (B, 1, d_joint) self-token representing the query node at t=now."""
-        B, dev, P = ids.shape[0], ids.device, self.patch_size
-
-        # Zero edge (no actual edge to self), zero co-occurrence
-        e_emb = self.proj_edge(torch.zeros(B, 1, self.proj_edge.in_features, device=dev))
-        c_emb = self.proj_co(torch.zeros(B, 1, self.proj_co.in_features, device=dev))
-
-        # Time delta = 0 for self; repeat P times to fill patch
-        t0 = self.time_enc(torch.zeros(B, 1, dtype=torch.float, device=dev))  # (B, 1, d_time)
-        t_emb = self.proj_time(t0.repeat(1, 1, P))  # (B, 1, P*d_time)
-
-        channels = [e_emb, t_emb, c_emb]
-        if self.proj_node is not None:
-            nf = self.node_feat[ids.long().clamp(0, self.node_feat.shape[0] - 1)]  # (B, d_node)
-            n_in = nf.unsqueeze(1).repeat(1, 1, P)   # (B, 1, P*d_node)
-            channels.append(self.proj_node(n_in))
-
-        return torch.cat(channels, dim=-1)   # (B, 1, d_joint)
 
     def _build_token(
         self, edge_feats: Tensor, time_feats: Tensor, co_feats: Tensor,
@@ -317,19 +327,9 @@ class DyGFormer(TemporalModel):
         return torch.cat(channels, dim=-1)
 
     def _patchify(self, x: Tensor) -> Tensor:
-        """(B, K, d) → (B, n_patches, patch_size*d)."""
-        B, K, d = x.shape
-        return x.reshape(B, self.n_patches, self.patch_size * d)
-
-    def _patch_padding_mask(self, mask: Tensor) -> Tensor:
-        """(B, K) bool → (B, n_patches) bool. Patch is valid if ANY token is valid."""
-        B, K = mask.shape
-        return mask.reshape(B, self.n_patches, self.patch_size).any(dim=2)  # (B, n_patches)
-
-    def _masked_mean(self, x: Tensor, mask: Tensor) -> Tensor:
-        """Mean pool x (B, T, d) over valid positions in mask (B, T)."""
-        m = mask.float().unsqueeze(-1)           # (B, T, 1)
-        return (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+        """(B, S, d) → (B, S//patch_size, patch_size*d)."""
+        B, S, d = x.shape
+        return x.reshape(B, S // self.patch_size, self.patch_size * d)
 
     @property
     def supports_independent_encode(self) -> bool:

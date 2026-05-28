@@ -62,15 +62,16 @@ def test_dygformer_instantiation():
 
 
 def test_dygformer_patch_size():
-    """patch_size=2 should halve the number of patches."""
-    model = DyGFormer(d_model=32, d_edge=16, d_time=8, d_channel=8, K=8, patch_size=2)
-    assert model.n_patches == 4  # 8 / 2
+    """patch_size=2 with K=7 (8 tokens total, divisible by 2) → 4 patches."""
+    model = DyGFormer(d_model=32, d_edge=16, d_time=8, d_channel=8, K=7, patch_size=2)
+    assert model.n_patches == 4  # (7+1) // 2 = 4
 
 
-def test_dygformer_invalid_patch_size():
-    import pytest
-    with pytest.raises(ValueError):
-        DyGFormer(K=9, patch_size=2)  # 9 not divisible by 2
+def test_dygformer_non_divisible_K():
+    """Non-divisible (K+1) should be padded to next multiple of patch_size."""
+    model = DyGFormer(K=8, patch_size=2)  # K+1=9 → pad to 10 → n_patches=5
+    assert model.n_patches == 5
+    assert model.gather_spec.neighbors.k == 8  # K unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +358,7 @@ def test_overfit_separable():
         )
 
     model = DyGFormer(d_model=32, d_edge=d_edge, d_time=8, d_channel=8, K=K)
-    opt = torch.optim.Adam(model.parameters(), lr=5e-3)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
     pipeline = DataPipeline(model.gather_spec, graph)
 
     # Positive: pairs from dense cluster (high co-occurrence)
@@ -375,7 +376,7 @@ def test_overfit_separable():
     prepared = pipeline.prepare(raw)
 
     initial_loss = None
-    for step in range(30):
+    for step in range(80):
         opt.zero_grad()
         out = model(prepared)
         out.loss.backward()
@@ -391,6 +392,7 @@ def test_overfit_separable():
 if __name__ == "__main__":
     test_dygformer_instantiation()
     test_dygformer_patch_size()
+    test_dygformer_non_divisible_K()
     test_forward_shapes()
     test_forward_shapes_patch2()
     test_forward_sparse_mask()

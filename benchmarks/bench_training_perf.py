@@ -280,9 +280,9 @@ def run_dataset(
     # Estimate GPU memory for ring buffer; fall back to smaller buffer if needed.
     buf = 32
     mem_gb = ds.num_nodes * buf * max(ds.edge_feat_dim, 1) * 4 / 1e9
-    if mem_gb > 8.0:
-        buf = max(4, int(32 * 8.0 / mem_gb))
-        print(f"  Ring buffer reduced {32}→{buf} (estimated {mem_gb:.1f} GB > 8 GB limit)")
+    if mem_gb > 4.0:
+        buf = max(4, int(32 * 4.0 / mem_gb))
+        print(f"  Ring buffer reduced {32}→{buf} (estimated {mem_gb:.1f} GB > 4 GB limit)")
 
     graph = TemporalGraph(ds.num_nodes, buffer_size=buf,
                           edge_feat_dim=ds.edge_feat_dim, device=device)
@@ -297,7 +297,7 @@ def run_dataset(
 
     model = DyGFormer(
         d_model=172, d_edge=ds.edge_feat_dim, d_time=100,
-        d_channel=50, K=buf, n_layers=2,
+        d_channel=50, K=31, n_layers=2,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: DyGFormer  ({n_params:,} params)")

@@ -35,21 +35,21 @@ class Time2Vec(nn.Module):
 
 
 class FixedCosineTimeEncoder(nn.Module):
-    """Fixed cosine time encoding matching DyGLib's TimeEncoder exactly.
+    """Cosine time encoding matching DyGLib's TimeEncoder.
 
-    Uses frequencies w = 1 / 10^linspace(0, 9, d_model) (fixed, not learnable).
-    This is the time encoder used in DyGFormer and GraphMixer reference implementations.
+    Uses frequencies w = 1 / 10^linspace(0, 9, d_model).
+    When learnable=True, weight (frequencies) and bias (phase shift) are trainable,
+    matching DyGFormer's internal TimeEncoder behavior.
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, learnable: bool = True):
         super().__init__()
         self.d_model = d_model
         # DyGLib: w = 1/10^linspace(0,9,d) → frequencies from 1 to 1e-9
         w = 1.0 / (10 ** np.linspace(0, 9, d_model, dtype=np.float32))
-        # Use nn.Linear with frozen weights (bias=0) to get w*t
         lin = nn.Linear(1, d_model, bias=True)
-        lin.weight = nn.Parameter(torch.from_numpy(w).reshape(d_model, 1), requires_grad=False)
-        lin.bias = nn.Parameter(torch.zeros(d_model), requires_grad=False)
+        lin.weight = nn.Parameter(torch.from_numpy(w).reshape(d_model, 1), requires_grad=learnable)
+        lin.bias = nn.Parameter(torch.zeros(d_model), requires_grad=learnable)
         self.linear = lin
 
     def forward(self, dt: Tensor) -> Tensor:

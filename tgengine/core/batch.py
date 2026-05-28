@@ -46,7 +46,8 @@ class RawBatch:
     dst: Tensor  # (B,) destination node IDs
     time: Tensor  # (B,) timestamps
     edge_feat: Optional[Tensor] = None  # (B, d_edge) edge features
-    neg: Optional[Tensor] = None  # (B,) or (B, N_neg) negative node IDs
+    neg: Optional[Tensor] = None  # (B,) or (B, N_neg) negative dst node IDs
+    neg_src: Optional[Tensor] = None  # (B,) negative src node IDs (for random-edge neg)
     edge_indices: Optional[Tensor] = None  # (B,) global edge indices (for TGB neg lookup)
 
     @property
@@ -73,8 +74,10 @@ class PreparedBatch:
 
     src_neighbors: NeighborData  # neighbors of src nodes
     dst_neighbors: NeighborData  # neighbors of dst nodes
-    neg_neighbors: NeighborData  # neighbors of neg nodes
+    neg_neighbors: NeighborData  # neighbors of neg dst nodes
+    neg_src_neighbors: Optional[NeighborData] = None  # neighbors of neg src nodes (random-edge neg)
 
+    neg_src: Optional[Tensor] = None  # (B,) negative src node IDs (random-edge neg)
     co_occurrence: Optional[Tensor] = None  # (B, K) co-neighbor counts or None
     memory_emb: Optional[Tensor] = None  # (B, d_mem) for TGN-style models
 
