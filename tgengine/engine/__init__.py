@@ -246,6 +246,92 @@ class MRREval(EvalProtocol):
         return 1.0 / rank
 
 
+class HitsEval(EvalProtocol):
+    """Hits@K evaluation: fraction of positives ranked in top-K among negatives.
+
+    Uses the same fixed negative candidate lists as MRREval (TGB-style).
+    Reports hits@1, hits@3, hits@10 by default.
+
+    Args:
+        neg_lists: (N_eval_edges, N_neg) pre-loaded negative node IDs.
+        ks: list of K values to compute Hits@K for.
+    """
+
+    def __init__(self, neg_lists: Tensor, ks: list[int] | None = None):
+        self.neg_lists = neg_lists
+        self.ks = ks or [1, 3, 10]
+
+    def evaluate(self, model, pipeline, eval_batches, graph):
+        model.eval()
+        all_ranks: list[Tensor] = []
+        edge_offset = 0
+
+        with torch.no_grad():
+            for raw_batch in eval_batches:
+                B = raw_batch.batch_size
+                neg = self.neg_lists[edge_offset : edge_offset + B].to(raw_batch.device)
+                edge_offset += B
+
+                if model.supports_independent_encode:
+                    rr = self._rank_encode(model, pipeline, raw_batch, neg)
+                else:
+                    rr = self._rank_pairwise(model, pipeline, raw_batch, neg)
+
+                all_ranks.append(rr)
+                graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+
+        ranks = torch.cat(all_ranks)  # (N,) 1-indexed ranks
+        results = {}
+        for k in self.ks:
+            results[f"hits@{k}"] = (ranks <= k).float().mean().item()
+        return results
+
+    def _rank_encode(self, model, pipeline, raw_batch, neg) -> Tensor:
+        """Fast path via encode_nodes."""
+        B, N_neg = neg.shape
+        k = pipeline.spec.neighbors.k
+        all_cands = torch.cat([raw_batch.dst.unsqueeze(1), neg], dim=1)
+        cands_flat = all_cands.reshape(-1)
+        times_cand = raw_batch.time.unsqueeze(1).expand(-1, 1 + N_neg).reshape(-1)
+
+        all_nodes = torch.cat([raw_batch.src, cands_flat])
+        all_times = torch.cat([raw_batch.time, times_cand])
+        all_nbrs = pipeline.graph.recent(all_nodes, all_times, k)
+
+        src_nbrs = NeighborData(
+            all_nbrs.neighbor_ids[:B], all_nbrs.timestamps[:B],
+            all_nbrs.edge_feats[:B], all_nbrs.mask[:B],
+        )
+        cand_nbrs = NeighborData(
+            all_nbrs.neighbor_ids[B:], all_nbrs.timestamps[B:],
+            all_nbrs.edge_feats[B:], all_nbrs.mask[B:],
+        )
+        src_emb = model.encode_nodes(src_nbrs, raw_batch.time)
+        cand_emb = model.encode_nodes(cand_nbrs, times_cand).view(B, 1 + N_neg, -1)
+        src_emb_exp = src_emb.unsqueeze(1).expand(-1, 1 + N_neg, -1)
+        scores = model.score_pairs(src_emb_exp, cand_emb)
+        pos_s = scores[:, 0:1]
+        return (scores >= pos_s).sum(dim=1).float()
+
+    def _rank_pairwise(self, model, pipeline, raw_batch, neg) -> Tensor:
+        """Slow path: expand to all pairs."""
+        B, N_neg = neg.shape
+        all_cands = torch.cat([raw_batch.dst.unsqueeze(1), neg], dim=1)
+        src_exp = raw_batch.src.unsqueeze(1).expand(-1, 1 + N_neg).reshape(-1)
+        cands_flat = all_cands.reshape(-1)
+        times_exp = raw_batch.time.unsqueeze(1).expand(-1, 1 + N_neg).reshape(-1)
+
+        big_batch = RawBatch(
+            src=src_exp, dst=cands_flat, time=times_exp,
+            edge_feat=None, neg=cands_flat,
+        )
+        prepared = pipeline.prepare(big_batch)
+        scores_flat = model(prepared).pos_score
+        scores = scores_flat.view(B, 1 + N_neg)
+        pos_s = scores[:, 0:1]
+        return (scores >= pos_s).sum(dim=1).float()
+
+
 class Engine:
     """Main training and evaluation engine.
 

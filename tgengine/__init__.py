@@ -15,6 +15,8 @@ from .models.freedyg import FreeDyG
 from .models.graphmixer import GraphMixer
 from .models.tgn import TGN
 from .pipeline.negatives import (
+    DyGLibHistoricalNegative,
+    DyGLibInductiveNegative,
     FixedNegative,
     HistoricalNegative,
     HistoricalNegPool,
@@ -50,6 +52,8 @@ __all__ = [
     "ThreeWayEval",
     "TrainConfig",
     # negatives
+    "DyGLibHistoricalNegative",
+    "DyGLibInductiveNegative",
     "FixedNegative",
     "HistoricalNegative",
     "HistoricalNegPool",

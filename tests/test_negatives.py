@@ -3,7 +3,10 @@
 import torch
 import pytest
 
-from tgengine.pipeline.negatives import FixedNegative, HistoricalNegPool, HistoricalNegative
+from tgengine.pipeline.negatives import (
+    FixedNegative, HistoricalNegPool, HistoricalNegative,
+    DyGLibHistoricalNegative, InductiveNegative, DyGLibInductiveNegative,
+)
 from tgengine.core.temporal_graph import TemporalGraph
 from tgengine.core.batch import RawBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
@@ -177,7 +180,7 @@ def test_co_occur_fusion_no_extra_kernel_call():
 
 
 # ---------------------------------------------------------------------------
-# HistoricalNegative (new, correct full-history semantics)
+# HistoricalNegative (per-src reservoir, fast approximate)
 # ---------------------------------------------------------------------------
 
 def test_historical_negative_update_and_sample():
@@ -191,17 +194,15 @@ def test_historical_negative_update_and_sample():
 
     neg = strategy.sample(src[:3], dst[:3], torch.zeros(3), graph=None)
     assert neg.shape == (3,)
-    # node 0 has history {10, 20, 30}, so sampled negatives must come from there
     assert set(neg.tolist()).issubset({10, 20, 30}), f"unexpected negatives: {neg.tolist()}"
 
 
 def test_historical_negative_uniform_distribution():
-    """HistoricalNegative samples uniformly from full history (not just recent K)."""
+    """HistoricalNegative samples uniformly from full history."""
     num_nodes = 200
     pool_size = 100
     strategy = HistoricalNegative(num_nodes=num_nodes, pool_size=pool_size, device="cpu")
 
-    # Give node 0 exactly 3 historical neighbors
     src = torch.zeros(3, dtype=torch.long)
     dst = torch.tensor([1, 2, 3])
     strategy.update(src, dst)
@@ -223,37 +224,26 @@ def test_historical_negative_uniform_distribution():
 
 
 def test_historical_negative_covers_beyond_ring_buffer():
-    """HistoricalNegative samples from the FULL history, not just recent K.
-
-    The key semantic guarantee: even if a node has 100 interactions, all of them
-    should have equal probability of being sampled — not just the last K=32
-    (which a ring-buffer-only approach would be limited to).
-    """
+    """HistoricalNegative samples from the FULL history."""
     num_nodes = 150
-    k_recent = 32  # ring buffer window size for comparison
+    k_recent = 32
     pool_size = 128
     strategy = HistoricalNegative(num_nodes=num_nodes, pool_size=pool_size, device="cpu")
 
-    # Node 0 has 100 interactions; the first 68 are older than ring buffer window
     n_interactions = 100
     src = torch.zeros(n_interactions, dtype=torch.long)
-    dst = torch.arange(1, n_interactions + 1)  # dsts: 1..100
+    dst = torch.arange(1, n_interactions + 1)
     strategy.update(src, dst)
 
-    # Sample many times and check which dst nodes appear
     n_trials = 5000
     neg = strategy.sample(torch.zeros(n_trials, dtype=torch.long),
                           torch.zeros(n_trials, dtype=torch.long),
                           torch.zeros(n_trials), graph=None)
 
     seen = set(neg.tolist())
-    # Old neighbors (1..68) should appear — not possible with ring-buffer-only approach
     old_neighbors = set(range(1, n_interactions - k_recent + 1))
     overlap = seen & old_neighbors
-    assert len(overlap) > 0, (
-        f"HistoricalNegative should sample from full history but none of the "
-        f"old neighbors {sorted(old_neighbors)[:5]}... appeared in {n_trials} trials"
-    )
+    assert len(overlap) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -284,4 +274,94 @@ def test_fixed_negative_requires_edge_indices():
     with pytest.raises(ValueError, match="edge_indices"):
         strategy.sample(torch.zeros(3), torch.zeros(3), torch.zeros(3), graph=None)
 
+
+# ---------------------------------------------------------------------------
+# HistoricalNegative (DyGLib-compatible, global edge set)
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+def test_dyglib_historical_basic():
+    """DyGLibHistoricalNegative returns dst from historical edge set."""
+    src = np.array([0, 1, 2, 0, 1, 3, 2, 0, 4, 1], dtype=np.int64)
+    dst = np.array([1, 2, 3, 2, 0, 4, 1, 3, 0, 3], dtype=np.int64)
+    times = np.arange(10, dtype=np.float64)
+
+    strategy = DyGLibHistoricalNegative(src, dst, times, seed=42)
+
+    # Query at time=8 means historical edges are those with t < 8 (indices 0..7)
+    batch_src = torch.tensor([0, 1])
+    batch_dst = torch.tensor([4, 3])  # current batch edges: (0,4), (1,3)
+    batch_time = torch.tensor([8.0, 8.5])
+
+    neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+    assert neg.shape == (2,)
+    # Neg dst should come from historical edges' dst values (excluding batch)
+    historical_before_8 = set(zip(src[:8].tolist(), dst[:8].tolist()))
+    current = {(0, 4), (1, 3)}
+    valid_dst = {e[1] for e in (historical_before_8 - current)}
+    assert all(int(v) in valid_dst for v in neg.tolist()), \
+        f"neg {neg.tolist()} not in valid_dst {valid_dst}"
+
+
+def test_dyglib_historical_fallback():
+    """DyGLibHistoricalNegative falls back to random when not enough historical edges."""
+    # Only 2 edges total
+    src = np.array([0, 1], dtype=np.int64)
+    dst = np.array([1, 0], dtype=np.int64)
+    times = np.array([1.0, 2.0])
+
+    strategy = DyGLibHistoricalNegative(src, dst, times, seed=42)
+
+    # Query at time=1.5: only 1 historical edge (0,1). Need 5 samples.
+    batch_src = torch.tensor([0, 1, 2, 3, 4])
+    batch_dst = torch.tensor([2, 3, 4, 0, 1])
+    batch_time = torch.tensor([1.5, 1.5, 1.5, 1.5, 1.5])
+
+    neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+    assert neg.shape == (5,)
+
+
+# ---------------------------------------------------------------------------
+# DyGLibInductiveNegative (DyGLib-compatible, edge-level inductive)
+# ---------------------------------------------------------------------------
+
+def test_dyglib_inductive_basic():
+    """DyGLibInductiveNegative returns dst from new edge pairs (not in training)."""
+    src = np.array([0, 1, 2, 0, 1, 3, 2, 0, 4, 1, 0, 2], dtype=np.int64)
+    dst = np.array([1, 2, 3, 2, 0, 4, 1, 3, 0, 3, 4, 4], dtype=np.int64)
+    times = np.arange(12, dtype=np.float64)
+
+    # Training period: edges 0-7 (last_observed_time=7)
+    last_observed_time = 7.0
+    strategy = DyGLibInductiveNegative(src, dst, times, last_observed_time=last_observed_time, seed=42)
+
+    # Query at time=10: historical edges = edges 0..9
+    # observed_edges = unique pairs in [0, 7] = edges 0..7
+    # inductive candidates = (edges 0..9 unique pairs) - observed - current_batch
+    batch_src = torch.tensor([0, 2])
+    batch_dst = torch.tensor([4, 4])  # these are edges 10, 11
+    batch_time = torch.tensor([10.0, 11.0])
+
+    neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+    assert neg.shape == (2,)
+
+
+def test_dyglib_inductive_no_candidates_fallback():
+    """DyGLibInductiveNegative falls back when no inductive edges exist."""
+    src = np.array([0, 1], dtype=np.int64)
+    dst = np.array([1, 0], dtype=np.int64)
+    times = np.array([1.0, 2.0])
+
+    # last_observed_time covers everything
+    strategy = DyGLibInductiveNegative(src, dst, times, last_observed_time=3.0, seed=42)
+
+    batch_src = torch.tensor([0, 1])
+    batch_dst = torch.tensor([1, 0])
+    batch_time = torch.tensor([2.5, 2.5])
+
+    # No inductive edges (all historical = observed), should fallback to random
+    neg = strategy.sample(batch_src, batch_dst, batch_time, graph=None)
+    assert neg.shape == (2,)
 
