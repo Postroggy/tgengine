@@ -215,6 +215,8 @@ def train_from_config(cfg: dict) -> dict[str, float]:
         grad_clip=train_cfg.get("grad_clip", 1.0),
         compile_model=train_cfg.get("compile_model", False),
         warmup_steps=train_cfg.get("warmup_steps", 0),
+        wandb_project=train_cfg.get("wandb_project"),
+        wandb_run_name=train_cfg.get("wandb_run_name"),
     )
 
     # --- Engine ---

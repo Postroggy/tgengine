@@ -40,6 +40,8 @@ class TrainConfig:
     grad_clip: float = 1.0  # max gradient norm (0 to disable)
     compile_model: bool = False  # torch.compile() the model forward pass
     warmup_steps: int = 0  # linear warmup steps (0 to disable scheduler)
+    wandb_project: Optional[str] = None  # if set, log to W&B with this project name
+    wandb_run_name: Optional[str] = None
 
 
 class EvalProtocol(ABC):
@@ -386,6 +388,29 @@ class Engine:
         self._current_epoch = 0
         self._best_val = 0.0
 
+        # W&B integration
+        self._wandb = None
+        if config.wandb_project:
+            try:
+                import wandb
+                wandb.init(
+                    project=config.wandb_project,
+                    name=config.wandb_run_name,
+                    config={
+                        "epochs": config.epochs,
+                        "batch_size": config.batch_size,
+                        "lr": config.lr,
+                        "patience": config.patience,
+                        "use_amp": config.use_amp,
+                        "grad_clip": config.grad_clip,
+                        "warmup_steps": config.warmup_steps,
+                        "model_params": sum(p.numel() for p in model.parameters()),
+                    },
+                )
+                self._wandb = wandb
+            except ImportError:
+                print("Warning: wandb not installed, skipping logging")
+
     def _build_scheduler(self):
         total_steps = self.config.epochs * len(self.train_batches)
         warmup = self.config.warmup_steps
@@ -461,9 +486,19 @@ class Engine:
                 patience_counter += 1
                 print(f"  Epoch {epoch}: loss={train_loss:.4f} val={val_score:.4f} patience={patience_counter}")
 
+            if self._wandb:
+                log = {"epoch": epoch, "train_loss": train_loss, "val_score": val_score}
+                if best_test:
+                    log.update({f"best_test_{k}": v for k, v in best_test.items()})
+                if self.scheduler:
+                    log["lr"] = self.scheduler.get_last_lr()[0]
+                self._wandb.log(log)
+
             if patience_counter >= self.config.patience:
                 break
 
+        if self._wandb:
+            self._wandb.finish()
         return best_test
 
     def _train_epoch(self) -> float:
