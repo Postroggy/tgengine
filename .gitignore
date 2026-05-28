@@ -12,3 +12,7 @@ htmlcov/
 *.so
 .env
 .venv/
+.claude/
+*.png
+benchmarks/debug_*
+benchmarks/diag_*
