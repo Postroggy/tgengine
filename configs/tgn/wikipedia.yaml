@@ -1,0 +1,17 @@
+model:
+  name: tgn
+  d_model: 172
+  d_edge: 172
+  n_gru_layers: 1
+  K: 32
+
+training:
+  epochs: 100
+  batch_size: 200
+  lr: 1e-4
+  patience: 20
+  device: cuda
+
+data:
+  root: /mnt/home/gyq/CodeBase/Graph/DG_Data
+  dataset: wikipedia

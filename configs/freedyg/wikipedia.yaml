@@ -1,0 +1,22 @@
+model:
+  name: freedyg
+  d_model: 172
+  d_edge: 172
+  d_time: 100
+  d_nif: 172
+  K: 32
+  num_layers: 2
+  dropout: 0.1
+  token_expansion: 0.5
+  channel_expansion: 4.0
+
+training:
+  epochs: 100
+  batch_size: 200
+  lr: 1e-4
+  patience: 20
+  device: cuda
+
+data:
+  root: /mnt/home/gyq/CodeBase/Graph/DG_Data
+  dataset: wikipedia

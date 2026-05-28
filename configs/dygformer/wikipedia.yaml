@@ -1,0 +1,22 @@
+model:
+  name: dygformer
+  d_model: 172
+  d_edge: 172
+  d_time: 100
+  d_channel: 50
+  K: 63
+  patch_size: 2
+  n_layers: 2
+  n_heads: 2
+  dropout: 0.1
+
+training:
+  epochs: 100
+  batch_size: 200
+  lr: 1e-4
+  patience: 20
+  device: cuda
+
+data:
+  root: /mnt/home/gyq/CodeBase/Graph/DG_Data
+  dataset: wikipedia
