@@ -19,3 +19,9 @@ training:
 data:
   root: /mnt/home/gyq/CodeBase/Graph/DG_Data
   dataset: wikipedia
+
+negative_sampling:
+  name: random
+
+eval:
+  name: ap

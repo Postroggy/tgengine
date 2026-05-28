@@ -16,7 +16,19 @@ training:
   lr: 1e-4
   patience: 20
   device: cuda
+  seed: 42
+  use_amp: false
+  grad_clip: 1.0
+  warmup_steps: 0
+  async_pipeline: false
+  checkpoint_dir: null
 
 data:
   root: /mnt/home/gyq/CodeBase/Graph/DG_Data
   dataset: uci
+
+negative_sampling:
+  name: random
+
+eval:
+  name: ap
