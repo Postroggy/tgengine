@@ -56,13 +56,25 @@ def cmd_list_models(args):
 
 def cmd_list_datasets(args):
     """List datasets available for auto-download."""
-    from tgengine.utils.download import list_available_datasets
-    datasets = list_available_datasets()
-    print("\nDatasets available for auto-download:")
-    for d in datasets:
-        print(f"  - {d}")
-    print(f"\nUsage: python -m tgengine download {datasets[0]}")
-    print(f"Or simply use load_dataset(\"{datasets[0]}\") — downloads automatically.\n")
+    from tgengine.utils.download import list_datasets_by_family
+    families = list_datasets_by_family()
+
+    print("\nDatasets available for auto-download:\n")
+    for family, datasets in families.items():
+        label = {
+            "dyglib": "DyGLib/DGB (link prediction, AP eval)",
+            "tgb": "TGB (link prediction, MRR eval)",
+            "tgbseq": "TGB-Seq (sequential dynamics, MRR eval)",
+        }.get(family, family)
+        print(f"  {label}:")
+        for d in datasets:
+            print(f"    - {d}")
+        print()
+
+    total = sum(len(v) for v in families.values())
+    print(f"Total: {total} datasets")
+    print(f"\nUsage: python -m tgengine download wikipedia")
+    print(f"Or: load_dataset(\"wikipedia\") — downloads automatically.\n")
 
 
 def main():

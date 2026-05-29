@@ -177,6 +177,15 @@ def train_from_config(cfg: dict) -> dict[str, float]:
         "valid_dst_nodes": valid_dst_nodes,
     }
 
+    # Auto-detect fixed neg samples → default to MRR eval
+    if ds.test_neg_candidates is not None:
+        dataset_info["neg_lists"] = ds.test_neg_candidates
+        eval_cfg = cfg.get("eval", {"name": "mrr"})
+        if "eval" not in cfg:
+            print("  Auto-selected MRR eval (fixed negative candidates detected)")
+    else:
+        eval_cfg = cfg.get("eval", {"name": "ap"})
+
     # --- Model ---
     model_cfg = dict(cfg.get("model", {}))
     K = model_cfg.get("K", 63)
@@ -204,7 +213,6 @@ def train_from_config(cfg: dict) -> dict[str, float]:
     neg_strategy = _build_neg_strategy(neg_cfg, dataset_info, device)
 
     # --- Eval protocol ---
-    eval_cfg = cfg.get("eval", {"name": "ap"})
     eval_protocol = _build_eval_protocol(eval_cfg, dataset_info, device)
 
     # --- TrainConfig ---

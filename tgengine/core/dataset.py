@@ -12,7 +12,6 @@ DyGLib-compatible data loading:
 
 from __future__ import annotations
 
-import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +54,10 @@ class TemporalDataset:
     # Edges filtered from training (new_test_node edges in train time window)
     # These must be loaded into graph during eval to match DyGLib's full_neighbor_sampler
     inductive_edges: Optional[dict] = None  # {src, dst, time, edge_feat} Tensors
+
+    # TGB/TGB-Seq fixed negative candidates for ranking eval (MRR)
+    val_neg_candidates: Optional[Tensor] = None   # (N_val, N_neg) node IDs
+    test_neg_candidates: Optional[Tensor] = None  # (N_test, N_neg) node IDs
 
     @property
     def edge_feat_dim(self) -> int:
@@ -112,28 +115,45 @@ def load_dataset(
     test_ratio: float = 0.15,
     auto_download: bool = True,
 ) -> TemporalDataset:
-    """Load a CTDG dataset with DyGLib-compatible preprocessing.
+    """Load a CTDG dataset. Unified entry point for all dataset families.
 
-    Features are zero-padded to 172 dimensions. Splits use time-quantile
-    thresholds. Random 10% of test-time nodes are held out for inductive eval.
+    Automatically detects dataset type by name prefix:
+      - tgbl-* → TGB link prediction (with fixed neg samples for MRR)
+      - tgbseq-* → TGB-Seq (with fixed neg samples for MRR)
+      - others → DyGLib format (time-quantile split + inductive eval)
 
     If the dataset is not found locally and auto_download is True, it will be
     downloaded automatically from public sources.
-
-    Expected files:
-        {dataset_path}/{dataset_name}/ml_{dataset_name}.csv
-        {dataset_path}/{dataset_name}/ml_{dataset_name}.npy (edge features)
-        {dataset_path}/{dataset_name}/ml_{dataset_name}_node.npy (node features, optional)
     """
+    base = Path(dataset_path) / dataset_name
+    # Try underscore variant (tgbl_uci vs tgbl-uci)
+    if not base.exists():
+        alt = Path(dataset_path) / dataset_name.replace("-", "_")
+        if alt.exists():
+            base = alt
+
+    # Auto-download if needed
+    if not base.exists():
+        if auto_download:
+            from tgengine.utils.download import download_dataset, ALL_DATASETS
+            if dataset_name in ALL_DATASETS:
+                download_dataset(dataset_name, dest_dir=dataset_path)
+
+    # Dispatch by dataset family
+    if dataset_name.startswith("tgbl-"):
+        return _load_tgb_csv(dataset_name, base, val_ratio, test_ratio)
+    elif dataset_name.startswith("tgbseq-"):
+        return _load_tgbseq_csv(dataset_name, base, val_ratio, test_ratio)
+    else:
+        return _load_dyglib(dataset_name, base, val_ratio, test_ratio)
+
+def _load_dyglib(
+    dataset_name: str, base: Path, val_ratio: float, test_ratio: float
+) -> TemporalDataset:
+    """Load DyGLib-format dataset with time-quantile splits + inductive eval."""
     import pandas as pd
 
-    base = Path(dataset_path) / dataset_name
     csv_path = base / f"ml_{dataset_name}.csv"
-
-    if not csv_path.exists() and auto_download:
-        from tgengine.utils.download import download_dataset
-        download_dataset(dataset_name, dest_dir=dataset_path)
-
     if not csv_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {csv_path}")
 
@@ -141,7 +161,6 @@ def load_dataset(
     src = df["u"].values.astype(np.int64)
     dst = df["i"].values.astype(np.int64)
     time_vals = df["ts"].values.astype(np.float64)
-    labels = df["label"].values
 
     # ---- feature loading & padding to 172 ----
     node_feat = None
@@ -159,7 +178,6 @@ def load_dataset(
         if edge_feat.shape[1] < PAD_FEAT_DIM:
             pad = torch.zeros(edge_feat.shape[0], PAD_FEAT_DIM - edge_feat.shape[1])
             edge_feat = torch.cat([edge_feat, pad], dim=1)
-        # Keep zero-row at index 0 (DyGLib compatibility: 0 = padding sentinel)
 
     num_nodes = max(src.max(), dst.max()) + 1
     num_edges = len(src)
@@ -178,24 +196,19 @@ def load_dataset(
     node_set = set(src) | set(dst)
     num_total_unique = len(node_set)
 
-    # Nodes appearing at test time
     test_node_set = set(src[time_vals > val_time]) | set(dst[time_vals > val_time])
-    # 10% of all unique nodes, sampled from test-time nodes, held out
     new_test_node_set = set(
         random.sample(list(test_node_set), int(0.1 * num_total_unique))
     )
 
-    # Remove edges involving new_test_nodes from training
     new_test_src = np.isin(src, list(new_test_node_set))
     new_test_dst = np.isin(dst, list(new_test_node_set))
     observed_mask = ~(new_test_src | new_test_dst)
     train_mask = train_mask & observed_mask
 
-    # New nodes = nodes never seen in training
     train_node_set = set(src[train_mask]) | set(dst[train_mask])
     new_node_set = node_set - train_node_set
 
-    # Inductive eval masks: edges with at least one node from new_node_set
     edge_contains_new = np.array([
         (s in new_node_set or d in new_node_set)
         for s, d in zip(src, dst)
@@ -210,7 +223,6 @@ def load_dataset(
         np.where(test_mask)[0],
     ])
 
-    # Edges filtered from training but needed for eval (DyGLib full_neighbor_sampler)
     inductive_train_mask = (time_vals <= val_time) & ~observed_mask
     inductive_idx = np.where(inductive_train_mask)[0]
     if len(inductive_idx) > 0:
@@ -231,7 +243,7 @@ def load_dataset(
 
     train_end = int(train_mask.sum())
     val_end = train_end + int(val_mask.sum())
-    num_edges = val_end + int(test_mask.sum())  # excludes train-time new-node edges
+    num_edges = val_end + int(test_mask.sum())
 
     print(
         f"The dataset has {num_edges} interactions, involving {num_total_unique} different nodes"
@@ -275,166 +287,337 @@ def load_dataset(
     )
 
 
-def load_tgb_dataset(
-    dataset_name: str,
-    dataset_path: str = "datasets",
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-) -> tuple[TemporalDataset, Optional[Tensor], Optional[Tensor]]:
-    """Load a TGB-format dataset with fixed negative candidate lists.
+def _load_tgb_csv(
+    dataset_name: str, base: Path, val_ratio: float, test_ratio: float
+) -> TemporalDataset:
+    """Load TGB dataset from original edgelist CSV + fixed negative samples.
 
-    Expected directory layout::
-
-        {dataset_path}/{dataset_name}/
-            ml_{dataset_name}.pkl          # DataFrame: u, i, ts, idx, [w]
-            ml_{dataset_name}_edge.pkl     # edge features (N, d_edge) ndarray
-            *val_ns*.pkl                   # val fixed negative dict
-            *test_ns*.pkl                  # test fixed negative dict
-
-    Edges are sorted chronologically and split into train/val/test.
-
-    Returns:
-        dataset: TemporalDataset with chronological splits.
-        val_neg_lists: (N_val, N_neg) tensor or None if not found.
-        test_neg_lists: (N_test, N_neg) tensor or None if not found.
+    Reads the TGB edgelist CSV directly (no reindexing during download).
+    Uses the same time-quantile split as TGB (0.70/0.85 by default) to
+    preserve alignment with pre-computed negative sample pkl files.
     """
     import pandas as pd
 
-    base = Path(dataset_path) / dataset_name
-    if not base.is_dir():
-        raise FileNotFoundError(f"Dataset directory not found: {base}")
+    # Find edgelist CSV
+    edgelist = None
+    for pattern in ["*edgelist*.csv"]:
+        candidates = sorted(base.glob(pattern))
+        if candidates:
+            edgelist = candidates[0]
+            break
 
-    # ---- locate DataFrame pickle -------------------------------------
-    df_candidates = sorted(base.glob("ml_*.pkl"))
-    if not df_candidates:
-        raise FileNotFoundError(f"No ml_*.pkl DataFrame found in {base}")
-    df_path = df_candidates[0]
+    if edgelist is None:
+        raise FileNotFoundError(f"No edgelist CSV found in {base}")
 
-    df = pd.read_pickle(str(df_path))
+    # TGB CSVs like tgbl-wiki have a "comma_separated_list_of_features" header
+    # that expands to 172 columns. Detect header/data column count mismatch.
+    with open(edgelist, "r") as f:
+        header_line = f.readline().strip()
+        data_line = f.readline().strip()
+    n_header = len(header_line.split(","))
+    n_data = len(data_line.split(","))
+
+    if n_data > n_header:
+        # Re-read with explicit column names: first (n_header-1) named + rest as feat_*
+        header_cols = header_line.split(",")
+        all_cols = header_cols[:-1] + [f"feat_{i}" for i in range(n_data - n_header + 1)]
+        df = pd.read_csv(str(edgelist), names=all_cols, skiprows=1)
+    else:
+        df = pd.read_csv(str(edgelist))
+
     # Standardize column names
     col_map = {}
     for c in df.columns:
         low = c.strip().lower()
-        if low in ("u", "src", "user_id", "source"):
-            col_map[c] = "src"
-        elif low in ("i", "dst", "item_id", "destination"):
-            col_map[c] = "dst"
-        elif low in ("ts", "timestamp", "time"):
-            col_map[c] = "time"
-        elif low in ("idx", "edge_idx", "index"):
-            col_map[c] = "idx"
+        if low in ("source", "src", "u", "head", "user_id"):
+            col_map[c] = "u"
+        elif low in ("destination", "dst", "i", "tail", "item_id"):
+            col_map[c] = "i"
+        elif low in ("timestamp", "ts", "time", "day"):
+            col_map[c] = "ts"
     df = df.rename(columns=col_map)
 
-    # ---- sort chronologically ---------------------------------------
-    df = df.sort_values("time").reset_index(drop=True)
+    if "u" not in df.columns or "i" not in df.columns or "ts" not in df.columns:
+        raise ValueError(f"Cannot identify u/i/ts columns in {edgelist}. Columns: {list(df.columns)}")
 
-    src_t = torch.from_numpy(df["src"].values.astype(np.int64)).long()
-    dst_t = torch.from_numpy(df["dst"].values.astype(np.int64)).long()
-    time_t = torch.from_numpy(df["time"].values.astype(np.float64)).double()
-    edge_indices = torch.from_numpy(df.get("idx", df.index).values.astype(np.int64)).long()
+    # Sort chronologically
+    df = df.sort_values("ts").reset_index(drop=True)
 
-    # ---- edge features -----------------------------------------------
-    edge_feat_t: Optional[Tensor] = None
-    feat_candidates = sorted(base.glob("ml_*_edge*"))
-    if feat_candidates:
-        edge_feat = np.load(str(feat_candidates[0]), allow_pickle=True)
-        if edge_feat.dtype == np.float64:
-            edge_feat = edge_feat.astype(np.float32)
-        edge_feat_t = torch.from_numpy(edge_feat).float()
-        # Edge feature rows correspond to original df order; reorder to match sort
-        if "idx" in df.columns:
-            idx_after_sort = df["idx"].values.astype(np.int64)
-            edge_feat_t = edge_feat_t[idx_after_sort]
+    src = df["u"].values.astype(np.int64)
+    dst = df["i"].values.astype(np.int64)
+    time_vals = df["ts"].values.astype(np.float64)
 
-    num_nodes = max(src_t.max(), dst_t.max()).item() + 1
-    num_edges = len(src_t)
+    # Extract edge features (numeric columns besides u, i, ts)
+    meta_cols = {"u", "i", "ts"}
+    feat_cols = [c for c in df.columns if c not in meta_cols
+                 and df[c].dtype in (np.float64, np.float32, np.int64, np.int32)]
 
-    # ---- load negative dicts & determine splits ----------------------
-    val_keys = _load_tgb_key_set(base, "val")
-    test_keys = _load_tgb_key_set(base, "test")
+    num_nodes = max(src.max(), dst.max()) + 1
+    num_edges = len(src)
 
-    # Classify each edge as train/val/test based on neg dict membership
-    edge_keys = set()
-    val_mask = np.zeros(num_edges, dtype=bool)
-    test_mask = np.zeros(num_edges, dtype=bool)
+    # Edge features: try pre-processed pkl/npy first, then CSV columns
+    edge_feat_t = _load_tgb_edge_features(base, df, meta_cols, num_edges)
 
-    for i in range(num_edges):
-        k = (int(src_t[i].item()), int(dst_t[i].item()), int(time_t[i].item()))
-        edge_keys.add(k)
-        if val_keys is not None and k in val_keys:
-            val_mask[i] = True
-        elif test_keys is not None and k in test_keys:
-            test_mask[i] = True
+    # Time-quantile split — same as TGB's generate_splits()
+    val_time, test_time = list(
+        np.quantile(time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)])
+    )
+    train_mask = time_vals <= val_time
+    val_mask = (time_vals > val_time) & (time_vals <= test_time)
+    test_mask = time_vals > test_time
 
-    train_mask = ~(val_mask | test_mask)
-
-    # Reorder: train first, then val, then test
+    # Reorder: train | val | test (already sorted by time within each split)
     order = np.concatenate([
         np.where(train_mask)[0],
         np.where(val_mask)[0],
         np.where(test_mask)[0],
     ])
 
-    src_t = src_t[order]
-    dst_t = dst_t[order]
-    time_t = time_t[order]
-    if edge_feat_t is not None:
-        edge_feat_t = edge_feat_t[order]
+    src_t = torch.from_numpy(src[order]).long()
+    dst_t = torch.from_numpy(dst[order]).long()
+    time_t = torch.from_numpy(time_vals[order]).double()
+    edge_feat_ordered = edge_feat_t[order] if edge_feat_t is not None else None
 
     train_end = int(train_mask.sum())
     val_end = train_end + int(val_mask.sum())
 
-    dataset = TemporalDataset(
-        src=src_t, dst=dst_t, time=time_t, edge_feat=edge_feat_t,
-        node_feat=None, num_nodes=num_nodes, num_edges=num_edges,
+    # Load fixed negative samples (keyed by original node IDs — no reindex needed)
+    val_neg = _load_neg_pkl(base, "val")
+    test_neg = _load_neg_pkl(base, "test")
+
+    # Node features (from node_feat CSV if present)
+    node_feat = _load_tgb_node_features(base, num_nodes)
+
+    print(f"TGB dataset '{dataset_name}': {num_edges} edges, {num_nodes} nodes")
+    print(f"  train: {train_end}, val: {val_end - train_end}, test: {num_edges - val_end}")
+    if val_neg is not None:
+        print(f"  val neg candidates: {val_neg.shape}")
+    if test_neg is not None:
+        print(f"  test neg candidates: {test_neg.shape}")
+
+    return TemporalDataset(
+        src=src_t, dst=dst_t, time=time_t,
+        edge_feat=edge_feat_ordered, node_feat=node_feat,
+        num_nodes=num_nodes, num_edges=num_edges,
         train_end=train_end, val_end=val_end,
+        val_neg_candidates=val_neg,
+        test_neg_candidates=test_neg,
     )
 
-    # ---- extract aligned negative lists ------------------------------
-    val_neg = _build_tgb_neg_tensor(dataset, train_end, val_end, val_keys, "val") \
-        if val_keys is not None else None
-    test_neg = _build_tgb_neg_tensor(dataset, val_end, num_edges, test_keys, "test") \
-        if test_keys is not None else None
 
-    return dataset, val_neg, test_neg
+def _load_tgbseq_csv(
+    dataset_name: str, base: Path, val_ratio: float, test_ratio: float
+) -> TemporalDataset:
+    """Load TGB-Seq dataset from original CSV, preserving the split column.
+
+    TGB-Seq CSVs contain a 'split' column (0=train, 1=val, 2=test) with
+    pre-computed splits that include node degree filtering. We use these
+    splits directly instead of re-computing time-quantile.
+    """
+    import pandas as pd
+
+    # Find the dataset CSV (named after HF repo name)
+    from tgengine.utils.download import _TGBSEQ_DATASETS
+    info = _TGBSEQ_DATASETS.get(dataset_name, {})
+    hf_name = info.get("hf_name", dataset_name)
+
+    csv_path = base / f"{hf_name}.csv"
+    if not csv_path.exists():
+        # Try any CSV
+        candidates = sorted(base.glob("*.csv"))
+        if candidates:
+            csv_path = candidates[0]
+        else:
+            raise FileNotFoundError(f"No CSV found in {base}")
+
+    df = pd.read_csv(str(csv_path))
+
+    # Standardize column names
+    col_map = {}
+    for c in df.columns:
+        low = c.strip().lower()
+        if low in ("source", "src", "u", "head", "user_id", "user"):
+            col_map[c] = "u"
+        elif low in ("destination", "dst", "i", "tail", "item_id", "item"):
+            col_map[c] = "i"
+        elif low in ("timestamp", "ts", "time"):
+            col_map[c] = "ts"
+    df = df.rename(columns=col_map)
+
+    if "u" not in df.columns or "i" not in df.columns or "ts" not in df.columns:
+        raise ValueError(f"Cannot identify u/i/ts columns. Columns: {list(df.columns)}")
+
+    src = df["u"].values.astype(np.int64)
+    dst = df["i"].values.astype(np.int64)
+    time_vals = df["ts"].values.astype(np.float64)
+
+    num_nodes = max(src.max(), dst.max()) + 1
+    num_edges = len(src)
+
+    # Use pre-computed split column if available
+    if "split" in df.columns:
+        split_col = df["split"].values
+        train_mask = split_col == 0
+        val_mask = split_col == 1
+        test_mask = split_col == 2
+    else:
+        # Fallback to time-quantile
+        val_time, test_time = list(
+            np.quantile(time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)])
+        )
+        train_mask = time_vals <= val_time
+        val_mask = (time_vals > val_time) & (time_vals <= test_time)
+        test_mask = time_vals > test_time
+
+    # Edge features (numeric columns besides u, i, ts, split)
+    meta_cols = {"u", "i", "ts", "split", "label", "idx"}
+    feat_cols = [c for c in df.columns if c not in meta_cols
+                 and df[c].dtype in (np.float64, np.float32, np.int64, np.int32)]
+
+    edge_feat_t: Optional[Tensor] = None
+    if feat_cols:
+        feats = df[feat_cols].values.astype(np.float32)
+        edge_feat_t = torch.from_numpy(feats).float()
+        if edge_feat_t.shape[1] < PAD_FEAT_DIM:
+            pad = torch.zeros(num_edges, PAD_FEAT_DIM - edge_feat_t.shape[1])
+            edge_feat_t = torch.cat([edge_feat_t, pad], dim=1)
+
+    # Reorder: train | val | test
+    order = np.concatenate([
+        np.where(train_mask)[0],
+        np.where(val_mask)[0],
+        np.where(test_mask)[0],
+    ])
+
+    src_t = torch.from_numpy(src[order]).long()
+    dst_t = torch.from_numpy(dst[order]).long()
+    time_t = torch.from_numpy(time_vals[order]).double()
+    edge_feat_ordered = edge_feat_t[order] if edge_feat_t is not None else None
+
+    train_end = int(train_mask.sum())
+    val_end = train_end + int(val_mask.sum())
+
+    # Load fixed negative samples (npy)
+    test_neg = _load_neg_npy(base)
+
+    print(f"TGB-Seq dataset '{dataset_name}': {num_edges} edges, {num_nodes} nodes")
+    print(f"  train: {train_end}, val: {val_end - train_end}, test: {num_edges - val_end}")
+    if test_neg is not None:
+        print(f"  test neg candidates: {test_neg.shape}")
+
+    return TemporalDataset(
+        src=src_t, dst=dst_t, time=time_t,
+        edge_feat=edge_feat_ordered, node_feat=None,
+        num_nodes=num_nodes, num_edges=num_edges,
+        train_end=train_end, val_end=val_end,
+        test_neg_candidates=test_neg,
+    )
 
 
-def _load_tgb_key_set(base: Path, split: str) -> Optional[dict]:
-    """Load TGB negative pickle and return {(src,dst,time) -> neg_array} dict."""
+def _load_tgb_edge_features(
+    base: Path, df, meta_cols: set, num_edges: int
+) -> Optional[Tensor]:
+    """Load TGB edge features from pkl/npy file, or extract from CSV columns.
+
+    TGB datasets often have a pre-processed edge feature file (ml_*_edge.pkl
+    or similar). If not found, falls back to numeric CSV columns.
+    """
+    import pickle
+
+    # Try pkl edge feature file
+    for pattern in ["*_edge*.pkl", "*_edge*.npy"]:
+        candidates = sorted(base.glob(pattern))
+        if candidates:
+            path = candidates[0]
+            if path.suffix == ".pkl":
+                with open(path, "rb") as f:
+                    arr = pickle.load(f)
+            else:
+                arr = np.load(str(path), allow_pickle=True)
+            if isinstance(arr, np.ndarray):
+                feat = torch.from_numpy(arr.astype(np.float32)).float()
+                if feat.shape[0] == num_edges + 1:
+                    feat = feat[1:]  # strip zero-row if present
+                if feat.shape[0] == num_edges:
+                    if feat.shape[1] < PAD_FEAT_DIM:
+                        pad = torch.zeros(num_edges, PAD_FEAT_DIM - feat.shape[1])
+                        feat = torch.cat([feat, pad], dim=1)
+                    return feat
+
+    # Fallback: numeric columns from CSV
+    feat_cols = [c for c in df.columns if c not in meta_cols
+                 and df[c].dtype in (np.float64, np.float32, np.int64, np.int32)]
+    if feat_cols:
+        feats = df[feat_cols].values.astype(np.float32)
+        feat = torch.from_numpy(feats).float()
+        if feat.shape[1] < PAD_FEAT_DIM:
+            pad = torch.zeros(num_edges, PAD_FEAT_DIM - feat.shape[1])
+            feat = torch.cat([feat, pad], dim=1)
+        return feat
+
+    return None
+
+
+def _load_tgb_node_features(base: Path, num_nodes: int) -> Optional[Tensor]:
+    """Load TGB node features from CSV if present."""
+    import pandas as pd
+
+    candidates = sorted(base.glob("*node_feat*"))
+    if not candidates:
+        return None
+    path = candidates[0]
+    if path.suffix == ".csv":
+        nf = pd.read_csv(str(path))
+        arr = nf.iloc[:, 1:].values.astype(np.float32)
+    elif path.suffix == ".npy":
+        arr = np.load(str(path)).astype(np.float32)
+    else:
+        return None
+    node_feat = torch.from_numpy(arr).float()
+    if node_feat.shape[1] < PAD_FEAT_DIM:
+        pad = torch.zeros(node_feat.shape[0], PAD_FEAT_DIM - node_feat.shape[1])
+        node_feat = torch.cat([node_feat, pad], dim=1)
+    return node_feat
+
+
+def _load_neg_pkl(base: Path, split: str) -> Optional[Tensor]:
+    """Load TGB negative sample pkl file → (N, N_neg) tensor."""
+    import pickle
+
     candidates = sorted(base.glob(f"*{split}_ns*.pkl"))
     if not candidates:
         return None
 
+    print(f"  Loading {candidates[0].name}...")
     with open(candidates[0], "rb") as f:
         neg_dict = pickle.load(f)
 
-    return {(int(k[0]), int(k[1]), int(k[2])): v for k, v in neg_dict.items()}
+    if isinstance(neg_dict, dict):
+        neg_arrays = list(neg_dict.values())
+        if not neg_arrays:
+            return None
+        # All arrays usually same length; use np.stack for speed
+        n_neg = neg_arrays[0].shape[0]
+        uniform = all(a.shape[0] == n_neg for a in neg_arrays)
+        if uniform:
+            stacked = np.stack(neg_arrays)
+        else:
+            n_neg = max(a.shape[0] for a in neg_arrays)
+            stacked = np.full((len(neg_arrays), n_neg), -1, dtype=np.float64)
+            for i, a in enumerate(neg_arrays):
+                stacked[i, :a.shape[0]] = a
+        return torch.from_numpy(stacked.astype(np.int64)).long()
+    elif isinstance(neg_dict, np.ndarray):
+        return torch.from_numpy(neg_dict.astype(np.int64)).long()
+    return None
 
 
-def _build_tgb_neg_tensor(
-    dataset: TemporalDataset, start: int, end: int,
-    lookup: dict, split: str,
-) -> Tensor:
-    """Build (N_eval, n_neg) tensor from pre-loaded neg dict."""
-    neg_list: list[Tensor] = []
-    for i in range(start, end):
-        key = (int(dataset.src[i].item()), int(dataset.dst[i].item()),
-               int(dataset.time[i].item()))
-        arr = lookup.get(key)
-        if arr is None:
-            raise KeyError(
-                f"Negative list not found for edge {key} in {split} "
-                f"(edge {i - start}/{end - start})"
-            )
-        neg_list.append(torch.from_numpy(arr.astype(np.int64)).long())
+def _load_neg_npy(base: Path) -> Optional[Tensor]:
+    """Load TGB-Seq negative sample npy file → (N, N_neg) tensor."""
+    candidates = sorted(base.glob("*_test_ns*.npy"))
+    if not candidates:
+        return None
+    arr = np.load(str(candidates[0]))
+    return torch.from_numpy(arr.astype(np.int64)).long()
 
-    if not neg_list:
-        raise ValueError(f"No eval edges found for {split}")
 
-    n_neg = max(n.shape[0] for n in neg_list)
-    padded = []
-    for n in neg_list:
-        if n.shape[0] < n_neg:
-            n = torch.cat([n, torch.full((n_neg - n.shape[0],), -1, dtype=torch.long)])
-        padded.append(n)
-    return torch.stack(padded)  # (N_eval, n_neg)
