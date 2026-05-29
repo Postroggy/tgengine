@@ -1,55 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 100">
   <defs>
-    <style>
-      @keyframes pulse-hub {
-        0%, 100% { r: 18; opacity: 0.08; }
-        50%       { r: 26; opacity: 0.02; }
-      }
-      @keyframes pulse-hub2 {
-        0%, 100% { r: 12; opacity: 0.13; }
-        50%       { r: 17; opacity: 0.04; }
-      }
-      @keyframes pulse-dst {
-        0%, 100% { r: 14; opacity: 0.06; }
-        50%       { r: 20; opacity: 0.02; }
-      }
-      @keyframes travel1 {
-        0%   { offset-distance: 0%;   opacity: 0; }
-        5%   { opacity: 1; }
-        95%  { opacity: 1; }
-        100% { offset-distance: 100%; opacity: 0; }
-      }
-      @keyframes travel2 {
-        0%   { offset-distance: 0%;   opacity: 0; }
-        5%   { opacity: 1; }
-        95%  { opacity: 1; }
-        100% { offset-distance: 100%; opacity: 0; }
-      }
-      .ring1 { animation: pulse-hub  2.8s ease-in-out infinite; }
-      .ring2 { animation: pulse-hub2 2.8s ease-in-out infinite 0.4s; }
-      .ring3 { animation: pulse-dst  3.2s ease-in-out infinite 1.4s; }
-      .dot1  {
-        offset-path: path('M 20,50 L 60,14');
-        offset-rotate: 0deg;
-        animation: travel1 1.9s linear infinite 0s;
-      }
-      .dot2  {
-        offset-path: path('M 20,50 L 62,86');
-        offset-rotate: 0deg;
-        animation: travel1 2.2s linear infinite 0.5s;
-      }
-      .dot3  {
-        offset-path: path('M 60,14 L 102,50');
-        offset-rotate: 0deg;
-        animation: travel2 1.8s linear infinite 0.9s;
-      }
-      .dot4  {
-        offset-path: path('M 62,86 L 102,50');
-        offset-rotate: 0deg;
-        animation: travel2 2.0s linear infinite 1.3s;
-      }
-    </style>
-
     <linearGradient id="eg1" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#6366f1"/>
       <stop offset="100%" stop-color="#818cf8"/>
@@ -80,6 +30,11 @@
     </radialGradient>
   </defs>
 
+  <!-- Pulse rings (static) -->
+  <circle cx="20" cy="50" r="20" fill="#6366f1" opacity="0.07"/>
+  <circle cx="20" cy="50" r="14" fill="#6366f1" opacity="0.11"/>
+  <circle cx="102" cy="50" r="15" fill="#6366f1" opacity="0.06"/>
+
   <!-- Edges -->
   <line x1="20" y1="50" x2="60" y2="14"  stroke="url(#eg1)" stroke-width="2.2" stroke-linecap="round"/>
   <line x1="20" y1="50" x2="62" y2="86"  stroke="url(#eg2)" stroke-width="2.2" stroke-linecap="round"/>
@@ -88,24 +43,17 @@
   <path d="M 20,50 C 58,22 66,22 102,50" fill="none" stroke="#a5b4fc"
         stroke-width="1.6" stroke-dasharray="4 3" opacity="0.4"/>
 
-  <!-- Traveling dots (CSS offset-path) -->
-  <circle class="dot1" r="2.8" fill="#c7d2fe"/>
-  <circle class="dot2" r="2.8" fill="#c7d2fe"/>
-  <circle class="dot3" r="2.4" fill="#a5b4fc"/>
-  <circle class="dot4" r="2.4" fill="#a5b4fc"/>
+  <!-- Traveling dots (static, mid-path) -->
+  <circle cx="40" cy="32" r="2.8" fill="#c7d2fe" opacity="0.9"/>
+  <circle cx="41" cy="68" r="2.8" fill="#c7d2fe" opacity="0.9"/>
+  <circle cx="81" cy="32" r="2.4" fill="#a5b4fc" opacity="0.9"/>
+  <circle cx="82" cy="68" r="2.4" fill="#a5b4fc" opacity="0.9"/>
 
-  <!-- Hub node pulses -->
-  <circle class="ring1" cx="20" cy="50" r="18" fill="#6366f1" opacity="0.08"/>
-  <circle class="ring2" cx="20" cy="50" r="12" fill="#6366f1" opacity="0.13"/>
-  <circle cx="20" cy="50" r="9.5" fill="url(#ng-hub)"/>
-
-  <!-- Mid nodes -->
-  <circle cx="60" cy="14" r="6.5" fill="url(#ng-mid)"/>
-  <circle cx="62" cy="86" r="6.5" fill="url(#ng-mid)"/>
-
-  <!-- Destination node -->
-  <circle class="ring3" cx="102" cy="50" r="14" fill="#6366f1" opacity="0.06"/>
-  <circle cx="102" cy="50" r="8" fill="url(#ng-dst)"/>
+  <!-- Nodes -->
+  <circle cx="20"  cy="50" r="9.5" fill="url(#ng-hub)"/>
+  <circle cx="60"  cy="14" r="6.5" fill="url(#ng-mid)"/>
+  <circle cx="62"  cy="86" r="6.5" fill="url(#ng-mid)"/>
+  <circle cx="102" cy="50" r="8"   fill="url(#ng-dst)"/>
 
   <!-- Title -->
   <text x="126" y="60"
