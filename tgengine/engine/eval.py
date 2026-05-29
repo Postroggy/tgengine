@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import numpy as np
 import torch
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    roc_auc_score,
+)
 from torch import Tensor
 
 from tgengine.core.batch import NeighborData, RawBatch
@@ -253,3 +261,229 @@ class HitsEval(RankingEval):
 
     def _aggregate_ranks(self, ranks: Tensor) -> dict[str, float]:
         return {f"hits@{k}": (ranks <= k).float().mean().item() for k in self.ks}
+
+
+# ---------------------------------------------------------------------------
+# Node-level evaluation protocols
+# ---------------------------------------------------------------------------
+
+class NodeClsEval(EvalProtocol):
+    """Node classification evaluation: accuracy, macro-F1, optionally AUC-ROC.
+
+    Expects model.forward() to return ``node_pred`` (logits) and ``node_labels``.
+
+    Args:
+        num_classes: number of node classes (>2 disables AUC-ROC by default).
+        include_auc: force AUC-ROC (one-vs-rest, requires sklearn ≥0.22).
+    """
+
+    def __init__(self, num_classes: int, include_auc: bool = False):
+        self.num_classes = num_classes
+        self.include_auc = include_auc
+
+    def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
+        model.eval()
+        all_logits, all_labels = [], []
+
+        with torch.no_grad():
+            for raw_batch in eval_batches:
+                prepared = pipeline.prepare(raw_batch)
+                out = model(prepared)
+                if out.node_pred is None or out.node_labels is None:
+                    continue
+                all_logits.append(out.node_pred.cpu())
+                all_labels.append(out.node_labels.cpu())
+
+        if not all_logits:
+            return {}
+
+        logits = torch.cat(all_logits)
+        labels = torch.cat(all_labels).long().numpy()
+
+        if logits.dim() == 1:
+            # binary
+            probs = torch.sigmoid(logits).numpy()
+            preds = (probs >= 0.5).astype(int)
+        else:
+            probs = torch.softmax(logits, dim=-1).numpy()
+            preds = probs.argmax(axis=1)
+
+        result = {
+            "acc": float(accuracy_score(labels, preds)),
+            "f1_macro": float(f1_score(labels, preds, average="macro", zero_division=0)),
+        }
+        if self.include_auc:
+            try:
+                if self.num_classes == 2:
+                    result["auc"] = float(roc_auc_score(labels, probs[:, 1] if probs.ndim > 1 else probs))
+                else:
+                    result["auc_ovr"] = float(roc_auc_score(labels, probs, multi_class="ovr"))
+            except ValueError:
+                pass
+        return result
+
+
+class NodeRegEval(EvalProtocol):
+    """Node regression evaluation: MAE and RMSE.
+
+    Expects model.forward() to return ``node_pred`` (scalar predictions) and ``node_labels``.
+    """
+
+    def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
+        model.eval()
+        all_preds, all_labels = [], []
+
+        with torch.no_grad():
+            for raw_batch in eval_batches:
+                prepared = pipeline.prepare(raw_batch)
+                out = model(prepared)
+                if out.node_pred is None or out.node_labels is None:
+                    continue
+                all_preds.append(out.node_pred.cpu())
+                all_labels.append(out.node_labels.cpu())
+
+        if not all_preds:
+            return {}
+
+        preds = torch.cat(all_preds).numpy()
+        labels = torch.cat(all_labels).numpy()
+        mae = float(mean_absolute_error(labels, preds))
+        rmse = float(np.sqrt(mean_squared_error(labels, preds)))
+        return {"mae": mae, "rmse": rmse}
+
+
+# ---------------------------------------------------------------------------
+# Edge-level evaluation protocols
+# ---------------------------------------------------------------------------
+
+class EdgeClsEval(EvalProtocol):
+    """Edge classification evaluation: accuracy, macro-F1, optionally AUC-ROC.
+
+    Expects model.forward() to return ``edge_pred`` (logits) and ``edge_labels``.
+    """
+
+    def __init__(self, num_classes: int, include_auc: bool = False):
+        self.num_classes = num_classes
+        self.include_auc = include_auc
+
+    def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
+        model.eval()
+        all_logits, all_labels = [], []
+
+        with torch.no_grad():
+            for raw_batch in eval_batches:
+                prepared = pipeline.prepare(raw_batch)
+                out = model(prepared)
+                if out.edge_pred is None or out.edge_labels is None:
+                    continue
+                all_logits.append(out.edge_pred.cpu())
+                all_labels.append(out.edge_labels.cpu())
+
+        if not all_logits:
+            return {}
+
+        logits = torch.cat(all_logits)
+        labels = torch.cat(all_labels).long().numpy()
+
+        if logits.dim() == 1:
+            probs = torch.sigmoid(logits).numpy()
+            preds = (probs >= 0.5).astype(int)
+        else:
+            probs = torch.softmax(logits, dim=-1).numpy()
+            preds = probs.argmax(axis=1)
+
+        result = {
+            "acc": float(accuracy_score(labels, preds)),
+            "f1_macro": float(f1_score(labels, preds, average="macro", zero_division=0)),
+        }
+        if self.include_auc:
+            try:
+                if self.num_classes == 2:
+                    result["auc"] = float(roc_auc_score(labels, probs[:, 1] if probs.ndim > 1 else probs))
+                else:
+                    result["auc_ovr"] = float(roc_auc_score(labels, probs, multi_class="ovr"))
+            except ValueError:
+                pass
+        return result
+
+
+class EdgeRegEval(EvalProtocol):
+    """Edge regression evaluation: MAE and RMSE.
+
+    Expects model.forward() to return ``edge_pred`` and ``edge_labels``.
+    """
+
+    def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
+        model.eval()
+        all_preds, all_labels = [], []
+
+        with torch.no_grad():
+            for raw_batch in eval_batches:
+                prepared = pipeline.prepare(raw_batch)
+                out = model(prepared)
+                if out.edge_pred is None or out.edge_labels is None:
+                    continue
+                all_preds.append(out.edge_pred.cpu())
+                all_labels.append(out.edge_labels.cpu())
+
+        if not all_preds:
+            return {}
+
+        preds = torch.cat(all_preds).numpy()
+        labels = torch.cat(all_labels).numpy()
+        return {
+            "mae": float(mean_absolute_error(labels, preds)),
+            "rmse": float(np.sqrt(mean_squared_error(labels, preds))),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Anomaly detection evaluation protocol
+# ---------------------------------------------------------------------------
+
+class AnomalyEval(EvalProtocol):
+    """Temporal anomaly detection evaluation: AUROC and Average Precision.
+
+    Expects model.forward() to return ``anomaly_score`` (B,) and ``node_labels``
+    (0=normal, 1=anomaly) — or ``edge_labels`` for edge-level anomalies.
+
+    Args:
+        label_source: "node" (uses node_labels) or "edge" (uses edge_labels).
+    """
+
+    def __init__(self, label_source: str = "node"):
+        assert label_source in ("node", "edge")
+        self.label_source = label_source
+
+    def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
+        model.eval()
+        all_scores, all_labels = [], []
+
+        with torch.no_grad():
+            for raw_batch in eval_batches:
+                prepared = pipeline.prepare(raw_batch)
+                out = model(prepared)
+                if out.anomaly_score is None:
+                    continue
+                labels_tensor = out.node_labels if self.label_source == "node" else out.edge_labels
+                if labels_tensor is None:
+                    continue
+                all_scores.append(out.anomaly_score.cpu())
+                all_labels.append(labels_tensor.cpu())
+
+        if not all_scores:
+            return {}
+
+        scores = torch.cat(all_scores).numpy()
+        labels = torch.cat(all_labels).long().numpy()
+
+        try:
+            auroc = float(roc_auc_score(labels, scores))
+        except ValueError:
+            auroc = float("nan")
+        try:
+            ap = float(average_precision_score(labels, scores))
+        except ValueError:
+            ap = float("nan")
+
+        return {"auroc": auroc, "ap": ap}

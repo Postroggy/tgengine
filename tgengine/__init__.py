@@ -7,7 +7,35 @@ from .core.dataset import TemporalDataset, load_dataset
 from .utils.download import download_dataset, list_available_datasets, list_datasets_by_family, set_proxy
 from .core.gather_spec import GatherSpec, NeighborSpec
 from .core.temporal_graph import TemporalGraph
-from .engine import APEval, AUCEval, Engine, EvalProtocol, HitsEval, MRREval, RankingEval, ThreeWayEval, TrainConfig, run_experiment
+from .engine import (
+    APEval,
+    AUCEval,
+    AnomalyEval,
+    EdgeClsEval,
+    EdgeRegEval,
+    Engine,
+    EvalProtocol,
+    HitsEval,
+    MRREval,
+    NodeClsEval,
+    NodeRegEval,
+    RankingEval,
+    ThreeWayEval,
+    TrainConfig,
+    run_experiment,
+)
+from .tasks import (
+    AnomalyDetectionHead,
+    EdgeBinaryClassificationHead,
+    EdgeClassificationHead,
+    EdgeRegressionHead,
+    LinkPredHead,
+    MultiTaskHead,
+    NodeBinaryClassificationHead,
+    NodeClassificationHead,
+    NodeRegressionHead,
+    TaskHead,
+)
 from .pipeline.async_pipeline import AsyncDataPipeline
 from .models.base import ModelOutput, TemporalModel
 from .models.dygformer import DyGFormer
@@ -49,13 +77,31 @@ __all__ = [
     # engine
     "APEval",
     "AUCEval",
+    "AnomalyEval",
     "AsyncDataPipeline",
+    "EdgeClsEval",
+    "EdgeRegEval",
     "Engine",
     "EvalProtocol",
+    "HitsEval",
     "MRREval",
+    "NodeClsEval",
+    "NodeRegEval",
+    "RankingEval",
     "ThreeWayEval",
     "TrainConfig",
     "run_experiment",
+    # task heads
+    "AnomalyDetectionHead",
+    "EdgeBinaryClassificationHead",
+    "EdgeClassificationHead",
+    "EdgeRegressionHead",
+    "LinkPredHead",
+    "MultiTaskHead",
+    "NodeBinaryClassificationHead",
+    "NodeClassificationHead",
+    "NodeRegressionHead",
+    "TaskHead",
     # negatives
     "DyGLibHistoricalNegative",
     "DyGLibInductiveNegative",

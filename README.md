@@ -328,6 +328,11 @@ TGEngine ships a comprehensive, pluggable evaluation system with **zero boilerpl
 | `ThreeWayEval` | AP × 3 | Random · historical · inductive neg splits |
 | `MRREval` | Mean Reciprocal Rank | TGB fixed-negative-list ranking |
 | `HitsEval` | Hits@1/3/10 | Top-K ranking quality |
+| `NodeClsEval` | Acc · F1 · AUC | Node classification |
+| `NodeRegEval` | MAE · RMSE | Node regression |
+| `EdgeClsEval` | Acc · F1 · AUC | Edge/event classification |
+| `EdgeRegEval` | MAE · RMSE | Edge regression |
+| `AnomalyEval` | AUROC · AP | Temporal anomaly detection |
 
 ### Adaptive Eval Scheduling
 
@@ -356,6 +361,42 @@ TrainConfig(
 )
 # → saves up to 70% eval overhead on Reddit / LastFM
 ```
+
+---
+
+## 🧩 Downstream Tasks
+
+TGEngine supports every major temporal graph task via pluggable **TaskHead** modules. Attach any head to any backbone model — the engine handles labels automatically.
+
+| Task Head | Task type | Loss | Output |
+|-----------|-----------|------|--------|
+| `LinkPredHead` | Link prediction | BCE | pos/neg scores |
+| `NodeClassificationHead` | Node multi-class | CrossEntropy | logits (B, C) |
+| `NodeBinaryClassificationHead` | Node binary | BCE | logit (B,) |
+| `NodeRegressionHead` | Node regression | MSE / MAE | scalar (B,) |
+| `EdgeClassificationHead` | Edge multi-class | CrossEntropy | logits (B, C) |
+| `EdgeBinaryClassificationHead` | Edge binary (fraud) | BCE | logit (B,) |
+| `EdgeRegressionHead` | Edge regression | MSE / MAE | scalar (B,) |
+| `AnomalyDetectionHead` | Anomaly detection | BCE / Recon | score (B,) |
+| `MultiTaskHead` | Joint multi-task | Weighted sum | merged output |
+
+```python
+from tgengine.tasks import NodeClassificationHead, MultiTaskHead
+
+class MyNodeClassifier(TemporalModel):
+    gather_spec = GatherSpec(neighbors=NeighborSpec(k=32))
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = ...               # any sequence encoder
+        self.task_head = NodeClassificationHead(d_model=172, num_classes=7)
+
+    def forward(self, batch: PreparedBatch) -> ModelOutput:
+        emb = self.backbone(batch)        # (B, d)
+        return self.task_head(emb, batch.node_labels)
+```
+
+Labels are injected automatically from `TemporalDataset.node_labels` / `edge_labels` into every batch — no manual wiring needed.
 
 ---
 
@@ -487,7 +528,8 @@ tgengine/
 ├── engine/
 │   ├── __init__.py         # Engine · run_experiment
 │   ├── config.py           # TrainConfig
-│   └── eval.py             # APEval · AUCEval · MRREval · HitsEval · ThreeWayEval
+│   └── eval.py             # APEval · AUCEval · MRREval · HitsEval · NodeClsEval · ...
+├── tasks/                  # TaskHead · LinkPredHead · NodeCls · NodeReg · EdgeCls · EdgeReg · Anomaly · MultiTask
 └── utils/                  # logging · download · seed
 ```
 
@@ -498,12 +540,15 @@ tgengine/
 - [x] GPU-fused neighbor sampling (V1 vectorized PyTorch)
 - [x] Async prefetch pipeline
 - [x] AP · AUC · MRR · Hits@K · 3-Way eval protocols
+- [x] Node classification · regression eval protocols
+- [x] Edge classification · regression eval protocols
+- [x] Anomaly detection eval protocol (AUROC · AP)
 - [x] Adaptive eval scheduling
 - [x] 26-dataset unified loader (DyGLib / TGB / TGB-Seq)
 - [x] Structured JSON output + multi-seed `run_experiment`
 - [x] Custom CUDA / Triton kernels for temporal sampling — fused 1-hop/2-hop sampling + co-occurrence (3–28× speedup)
+- [x] Pluggable TaskHead system (node cls/reg · edge cls/reg · anomaly · multi-task)
 - [ ] Full-history negative sampling (T-CSR storage)
-- [ ] Node classification task support
 - [ ] `tgengine.hub` — download pretrained checkpoints
 
 ---

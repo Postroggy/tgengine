@@ -19,15 +19,33 @@ from tgengine.pipeline.negatives import NegativeStrategy
 from tgengine.utils.logging import TrainLogger, validate_config
 
 from .config import TrainConfig
-from .eval import APEval, AUCEval, EvalProtocol, HitsEval, MRREval, RankingEval, ThreeWayEval
+from .eval import (
+    APEval,
+    AUCEval,
+    AnomalyEval,
+    EdgeClsEval,
+    EdgeRegEval,
+    EvalProtocol,
+    HitsEval,
+    MRREval,
+    NodeClsEval,
+    NodeRegEval,
+    RankingEval,
+    ThreeWayEval,
+)
 
 __all__ = [
     "APEval",
     "AUCEval",
+    "AnomalyEval",
+    "EdgeClsEval",
+    "EdgeRegEval",
     "Engine",
     "EvalProtocol",
     "HitsEval",
     "MRREval",
+    "NodeClsEval",
+    "NodeRegEval",
     "RankingEval",
     "ThreeWayEval",
     "TrainConfig",
