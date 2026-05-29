@@ -4,6 +4,7 @@ __version__ = "0.1.0"
 
 from .core.batch import NeighborData, PreparedBatch, RawBatch
 from .core.dataset import TemporalDataset, load_dataset
+from .utils.download import download_dataset, list_available_datasets
 from .core.gather_spec import GatherSpec, NeighborSpec
 from .core.temporal_graph import TemporalGraph
 from .engine import APEval, AUCEval, Engine, EvalProtocol, HitsEval, MRREval, RankingEval, ThreeWayEval, TrainConfig, run_experiment

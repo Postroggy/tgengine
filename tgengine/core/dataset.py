@@ -110,11 +110,15 @@ def load_dataset(
     dataset_path: str = "datasets",
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
+    auto_download: bool = True,
 ) -> TemporalDataset:
     """Load a CTDG dataset with DyGLib-compatible preprocessing.
 
     Features are zero-padded to 172 dimensions. Splits use time-quantile
     thresholds. Random 10% of test-time nodes are held out for inductive eval.
+
+    If the dataset is not found locally and auto_download is True, it will be
+    downloaded automatically from public sources.
 
     Expected files:
         {dataset_path}/{dataset_name}/ml_{dataset_name}.csv
@@ -124,8 +128,12 @@ def load_dataset(
     import pandas as pd
 
     base = Path(dataset_path) / dataset_name
-
     csv_path = base / f"ml_{dataset_name}.csv"
+
+    if not csv_path.exists() and auto_download:
+        from tgengine.utils.download import download_dataset
+        download_dataset(dataset_name, dest_dir=dataset_path)
+
     if not csv_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {csv_path}")
 
