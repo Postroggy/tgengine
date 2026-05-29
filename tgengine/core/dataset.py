@@ -3,11 +3,24 @@
 Supports loading CTDG datasets from csv/npy files (DyGLib format)
 and TGB format, converting them into RawBatch streams.
 
-DyGLib-compatible data loading:
-  - Time-quantile splits (not index-based)
-  - Feature padding to 172 dimensions
-  - Transductive / inductive eval split
-  - Keeps zero-padding row at index 0 of feature matrices
+Split strategies (``split_strategy`` parameter in ``load_dataset``):
+
+  ``"event"`` (default, DyGLib-compatible):
+    Split boundary = the timestamp at which k% of events have occurred.
+    Equivalent to ``np.quantile(timestamps, 0.70)`` for train cutoff.
+    Every split contains an equal *fraction of events*.
+    Warning: if events cluster in time, val/test may cover very short
+    real-world windows even though they hold 15% of events.
+
+  ``"time"``:
+    Split boundary = t_min + k% * (t_max - t_min).
+    Each split covers a proportional *fraction of the time span*.
+    More realistic for deployment (train on data until date T, predict
+    future).  Val/test sizes in events can be unequal.
+
+Feature padding: edge features are zero-padded to 172 dimensions.
+Inductive eval: ~10% of test-set nodes are hidden from training
+  (DyGLib protocol, seed=2020).  Only applied to DyGLib-format datasets.
 """
 
 from __future__ import annotations
@@ -65,6 +78,11 @@ class TemporalDataset:
     num_node_classes: Optional[int] = None  # C for node classification
     num_edge_classes: Optional[int] = None  # C for edge classification
 
+    # Split metadata — for user inspection; not used by training logic
+    split_strategy: str = "event"  # "event" or "time"
+    val_time: float = 0.0    # timestamp at train/val boundary
+    test_time: float = 0.0   # timestamp at val/test boundary
+
     @property
     def edge_feat_dim(self) -> int:
         return self.edge_feat.shape[1] if self.edge_feat is not None else 0
@@ -72,6 +90,35 @@ class TemporalDataset:
     @property
     def node_feat_dim(self) -> int:
         return self.node_feat.shape[1] if self.node_feat is not None else 0
+
+    @property
+    def train_size(self) -> int:
+        return self.train_end
+
+    @property
+    def val_size(self) -> int:
+        return self.val_end - self.train_end
+
+    @property
+    def test_size(self) -> int:
+        return self.num_edges - self.val_end
+
+    def summary(self) -> str:
+        """Return a human-readable split summary string."""
+        lines = [
+            f"Dataset: {self.num_nodes} nodes, {self.num_edges} edges, "
+            f"d_edge={self.edge_feat_dim}",
+            f"Split ({self.split_strategy}-based):",
+            f"  train : {self.train_size:>7,} events  (t ≤ {self.val_time:.2f})",
+            f"  val   : {self.val_size:>7,} events  "
+            f"({self.val_time:.2f} < t ≤ {self.test_time:.2f})",
+            f"  test  : {self.test_size:>7,} events  (t > {self.test_time:.2f})",
+        ]
+        if self.inductive_edges is not None:
+            n = len(self.inductive_edges["src"])
+            pct = 100 * n / max(self.num_nodes, 1)
+            lines.append(f"  inductive nodes hidden from train: ~{pct:.1f}%")
+        return "\n".join(lines)
 
     def get_batches(self, split: str, batch_size: int, device: str = "cuda",
                     inductive_only: bool = False) -> list[RawBatch]:
@@ -135,22 +182,91 @@ class TemporalDataset:
         return batches
 
 
+def _compute_split_times(
+    time_vals: np.ndarray,
+    val_ratio: float,
+    test_ratio: float,
+    strategy: str,
+) -> tuple[float, float]:
+    """Compute (val_time, test_time) split boundaries.
+
+    "event": boundary at the timestamp where k% of events have occurred.
+             DyGLib default. 70% of events → train.
+    "time":  boundary at k% of the wall-clock time span.
+             70% of duration → train. Event counts per split may differ.
+    """
+    if strategy == "event":
+        val_time, test_time = np.quantile(
+            time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)]
+        )
+    elif strategy == "time":
+        t_min = float(time_vals.min())
+        t_max = float(time_vals.max())
+        span = t_max - t_min
+        val_time = t_min + span * (1 - val_ratio - test_ratio)
+        test_time = t_min + span * (1 - test_ratio)
+    else:
+        raise ValueError(
+            f"split_strategy must be 'event' or 'time', got '{strategy}'"
+        )
+    return float(val_time), float(test_time)
+
+
+def _print_split_summary(
+    dataset_name: str,
+    strategy: str,
+    train_end: int,
+    val_size: int,
+    test_size: int,
+    val_time: float,
+    test_time: float,
+    num_nodes: int,
+    n_inductive: int = 0,
+) -> None:
+    """Print a structured split summary so users can verify the split."""
+    total = train_end + val_size + test_size
+    print(f"Dataset: {dataset_name} | {total:,} edges | {num_nodes:,} nodes")
+    print(f"Split ({strategy}-based):")
+    print(f"  train : {train_end:>7,} events  (t ≤ {val_time:.2f})")
+    print(f"  val   : {val_size:>7,} events  ({val_time:.2f} < t ≤ {test_time:.2f})")
+    print(f"  test  : {test_size:>7,} events  (t > {test_time:.2f})")
+    if n_inductive > 0:
+        pct = 100 * n_inductive / max(num_nodes, 1)
+        print(f"  Inductive nodes hidden from train: {n_inductive} ({pct:.1f}%)")
+
+
 def load_dataset(
     dataset_name: str,
     dataset_path: str = "datasets",
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
+    split_strategy: str = "event",
     auto_download: bool = True,
 ) -> TemporalDataset:
     """Load a CTDG dataset. Unified entry point for all dataset families.
 
-    Automatically detects dataset type by name prefix:
-      - tgbl-* → TGB link prediction (with fixed neg samples for MRR)
-      - tgbseq-* → TGB-Seq (with fixed neg samples for MRR)
-      - others → DyGLib format (time-quantile split + inductive eval)
+    Args:
+        dataset_name: dataset name (e.g. "uci", "wikipedia", "tgbl-wiki").
+        dataset_path: local directory where dataset files are stored.
+        val_ratio: fraction of data for validation (default 0.15).
+        test_ratio: fraction of data for testing (default 0.15).
+        split_strategy: how to compute split boundaries:
+            ``"event"`` (default) — boundary where k% of *events* have
+                occurred. Matches DyGLib / most published benchmarks.
+                Use this when reproducing paper numbers.
+            ``"time"`` — boundary at k% of the *time span* (t_max - t_min).
+                Each split covers a proportional wall-clock duration.
+                More realistic for deployment evaluation.
+        auto_download: download the dataset if not found locally.
 
-    If the dataset is not found locally and auto_download is True, it will be
-    downloaded automatically from public sources.
+    Returns:
+        :class:`TemporalDataset` with train/val/test pre-split.
+        Call ``dataset.summary()`` to inspect the split boundaries.
+
+    Automatically detects dataset type by name prefix:
+      - ``tgbl-*`` → TGB link prediction (with fixed neg samples for MRR)
+      - ``tgbseq-*`` → TGB-Seq (with fixed neg samples for MRR)
+      - others → DyGLib format (inductive eval split)
     """
     base = Path(dataset_path) / dataset_name
     # Try underscore variant (tgbl_uci vs tgbl-uci)
@@ -168,16 +284,17 @@ def load_dataset(
 
     # Dispatch by dataset family
     if dataset_name.startswith("tgbl-"):
-        return _load_tgb_csv(dataset_name, base, val_ratio, test_ratio)
+        return _load_tgb_csv(dataset_name, base, val_ratio, test_ratio, split_strategy)
     elif dataset_name.startswith("tgbseq-"):
-        return _load_tgbseq_csv(dataset_name, base, val_ratio, test_ratio)
+        return _load_tgbseq_csv(dataset_name, base, val_ratio, test_ratio, split_strategy)
     else:
-        return _load_dyglib(dataset_name, base, val_ratio, test_ratio)
+        return _load_dyglib(dataset_name, base, val_ratio, test_ratio, split_strategy)
 
 def _load_dyglib(
-    dataset_name: str, base: Path, val_ratio: float, test_ratio: float
+    dataset_name: str, base: Path, val_ratio: float, test_ratio: float,
+    split_strategy: str = "event",
 ) -> TemporalDataset:
-    """Load DyGLib-format dataset with time-quantile splits + inductive eval."""
+    """Load DyGLib-format dataset with configurable splits + inductive eval."""
     import pandas as pd
 
     csv_path = base / f"ml_{dataset_name}.csv"
@@ -209,16 +326,14 @@ def _load_dyglib(
     num_nodes = max(src.max(), dst.max()) + 1
     num_edges = len(src)
 
-    # ---- time-quantile splits ----
-    val_time, test_time = list(
-        np.quantile(time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)])
-    )
+    # ---- split boundaries ----
+    val_time, test_time = _compute_split_times(time_vals, val_ratio, test_ratio, split_strategy)
 
     train_mask = time_vals <= val_time
     val_mask = (time_vals > val_time) & (time_vals <= test_time)
     test_mask = time_vals > test_time
 
-    # ---- inductive node sets (matching DyGLib) ----
+    # ---- inductive node sets (matching DyGLib, seed=2020) ----
     random.seed(2020)
     node_set = set(src) | set(dst)
     num_total_unique = len(node_set)
@@ -272,30 +387,16 @@ def _load_dyglib(
     val_end = train_end + int(val_mask.sum())
     num_edges = val_end + int(test_mask.sum())
 
-    print(
-        f"The dataset has {num_edges} interactions, involving {num_total_unique} different nodes"
-    )
-    print(
-        f"The training dataset has {train_end} interactions, "
-        f"involving {len(train_node_set)} different nodes"
-    )
-    print(
-        f"The validation dataset has {val_mask.sum()} interactions, "
-        f"involving {len(set(src[val_mask]) | set(dst[val_mask]))} different nodes"
-    )
-    print(
-        f"The test dataset has {test_mask.sum()} interactions, "
-        f"involving {len(set(src[test_mask]) | set(dst[test_mask]))} different nodes"
-    )
-    print(
-        f"The new node validation dataset has {new_node_val_mask.sum()} interactions"
-    )
-    print(
-        f"The new node test dataset has {new_node_test_mask.sum()} interactions"
-    )
-    print(
-        f"{len(new_test_node_set)} nodes were used for the inductive testing, "
-        f"i.e. are never seen during training"
+    _print_split_summary(
+        dataset_name=dataset_name,
+        strategy=split_strategy,
+        train_end=train_end,
+        val_size=int(val_mask.sum()),
+        test_size=int(test_mask.sum()),
+        val_time=val_time,
+        test_time=test_time,
+        num_nodes=num_total_unique,
+        n_inductive=len(new_test_node_set),
     )
 
     return TemporalDataset(
@@ -311,11 +412,15 @@ def _load_dyglib(
         new_node_val_mask=new_node_val_t,
         new_node_test_mask=new_node_test_t,
         inductive_edges=inductive_edges,
+        split_strategy=split_strategy,
+        val_time=val_time,
+        test_time=test_time,
     )
 
 
 def _load_tgb_csv(
-    dataset_name: str, base: Path, val_ratio: float, test_ratio: float
+    dataset_name: str, base: Path, val_ratio: float, test_ratio: float,
+    split_strategy: str = "event",
 ) -> TemporalDataset:
     """Load TGB dataset from original edgelist CSV + fixed negative samples.
 
@@ -385,10 +490,8 @@ def _load_tgb_csv(
     # Edge features: try pre-processed pkl/npy first, then CSV columns
     edge_feat_t = _load_tgb_edge_features(base, df, meta_cols, num_edges)
 
-    # Time-quantile split — same as TGB's generate_splits()
-    val_time, test_time = list(
-        np.quantile(time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)])
-    )
+    # Split boundaries
+    val_time, test_time = _compute_split_times(time_vals, val_ratio, test_ratio, split_strategy)
     train_mask = time_vals <= val_time
     val_mask = (time_vals > val_time) & (time_vals <= test_time)
     test_mask = time_vals > test_time
@@ -415,8 +518,16 @@ def _load_tgb_csv(
     # Node features (from node_feat CSV if present)
     node_feat = _load_tgb_node_features(base, num_nodes)
 
-    print(f"TGB dataset '{dataset_name}': {num_edges} edges, {num_nodes} nodes")
-    print(f"  train: {train_end}, val: {val_end - train_end}, test: {num_edges - val_end}")
+    _print_split_summary(
+        dataset_name=dataset_name,
+        strategy=split_strategy,
+        train_end=train_end,
+        val_size=val_end - train_end,
+        test_size=num_edges - val_end,
+        val_time=val_time,
+        test_time=test_time,
+        num_nodes=num_nodes,
+    )
     if val_neg is not None:
         print(f"  val neg candidates: {val_neg.shape}")
     if test_neg is not None:
@@ -429,11 +540,15 @@ def _load_tgb_csv(
         train_end=train_end, val_end=val_end,
         val_neg_candidates=val_neg,
         test_neg_candidates=test_neg,
+        split_strategy=split_strategy,
+        val_time=val_time,
+        test_time=test_time,
     )
 
 
 def _load_tgbseq_csv(
-    dataset_name: str, base: Path, val_ratio: float, test_ratio: float
+    dataset_name: str, base: Path, val_ratio: float, test_ratio: float,
+    split_strategy: str = "event",
 ) -> TemporalDataset:
     """Load TGB-Seq dataset from original CSV, preserving the split column.
 
@@ -481,20 +596,24 @@ def _load_tgbseq_csv(
     num_nodes = max(src.max(), dst.max()) + 1
     num_edges = len(src)
 
-    # Use pre-computed split column if available
+    # Use pre-computed split column if available (ignores split_strategy)
     if "split" in df.columns:
         split_col = df["split"].values
         train_mask = split_col == 0
         val_mask = split_col == 1
         test_mask = split_col == 2
+        # Derive approximate time boundaries for metadata
+        val_time = float(time_vals[train_mask].max()) if train_mask.any() else 0.0
+        test_time = float(time_vals[val_mask].max()) if val_mask.any() else 0.0
+        _split_strat_used = "preset"
     else:
-        # Fallback to time-quantile
-        val_time, test_time = list(
-            np.quantile(time_vals, [(1 - val_ratio - test_ratio), (1 - test_ratio)])
+        val_time, test_time = _compute_split_times(
+            time_vals, val_ratio, test_ratio, split_strategy
         )
         train_mask = time_vals <= val_time
         val_mask = (time_vals > val_time) & (time_vals <= test_time)
         test_mask = time_vals > test_time
+        _split_strat_used = split_strategy
 
     # Edge features (numeric columns besides u, i, ts, split)
     meta_cols = {"u", "i", "ts", "split", "label", "idx"}
@@ -527,8 +646,16 @@ def _load_tgbseq_csv(
     # Load fixed negative samples (npy)
     test_neg = _load_neg_npy(base)
 
-    print(f"TGB-Seq dataset '{dataset_name}': {num_edges} edges, {num_nodes} nodes")
-    print(f"  train: {train_end}, val: {val_end - train_end}, test: {num_edges - val_end}")
+    _print_split_summary(
+        dataset_name=dataset_name,
+        strategy=_split_strat_used,
+        train_end=train_end,
+        val_size=val_end - train_end,
+        test_size=num_edges - val_end,
+        val_time=val_time,
+        test_time=test_time,
+        num_nodes=num_nodes,
+    )
     if test_neg is not None:
         print(f"  test neg candidates: {test_neg.shape}")
 
@@ -538,6 +665,9 @@ def _load_tgbseq_csv(
         num_nodes=num_nodes, num_edges=num_edges,
         train_end=train_end, val_end=val_end,
         test_neg_candidates=test_neg,
+        split_strategy=_split_strat_used,
+        val_time=val_time,
+        test_time=test_time,
     )
 
 

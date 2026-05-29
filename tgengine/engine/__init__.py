@@ -632,7 +632,9 @@ class Engine:
                                                     self._eval_graph, rb.edge_indices)
                 rb = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
                               edge_feat=rb.edge_feat, neg=neg,
-                              edge_indices=rb.edge_indices)
+                              edge_indices=rb.edge_indices,
+                              node_labels=rb.node_labels,
+                              edge_labels=rb.edge_labels)
             prepped.append(rb)
 
         all_metrics: dict[str, float] = {}

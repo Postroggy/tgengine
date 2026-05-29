@@ -270,25 +270,35 @@ class HitsEval(RankingEval):
 class NodeClsEval(EvalProtocol):
     """Node classification evaluation: accuracy, macro-F1, optionally AUC-ROC.
 
-    Expects model.forward() to return ``node_pred`` (logits) and ``node_labels``.
+    Expects model.forward() to return ``node_pred`` (logits) and ``node_labels``,
+    OR use ``head=`` to route through a NodeClassificationHead on top of model.encode().
 
     Args:
         num_classes: number of node classes (>2 disables AUC-ROC by default).
         include_auc: force AUC-ROC (one-vs-rest, requires sklearn ≥0.22).
+        head: optional NodeClassificationHead — when set, calls model.encode() + head().
     """
 
-    def __init__(self, num_classes: int, include_auc: bool = False):
+    def __init__(self, num_classes: int, include_auc: bool = False, head=None):
         self.num_classes = num_classes
         self.include_auc = include_auc
+        self.head = head
 
     def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
         model.eval()
+        if self.head is not None:
+            self.head.eval()
         all_logits, all_labels = [], []
 
         with torch.no_grad():
             for raw_batch in eval_batches:
                 prepared = pipeline.prepare(raw_batch)
-                out = model(prepared)
+                if self.head is not None:
+                    from tgengine.models.base import EmbeddingBundle
+                    bundle = model.encode(prepared)
+                    out = self.head(bundle.src, labels=prepared.node_labels)
+                else:
+                    out = model(prepared)
                 if out.node_pred is None or out.node_labels is None:
                     continue
                 all_logits.append(out.node_pred.cpu())
@@ -410,17 +420,30 @@ class EdgeClsEval(EvalProtocol):
 class EdgeRegEval(EvalProtocol):
     """Edge regression evaluation: MAE and RMSE.
 
-    Expects model.forward() to return ``edge_pred`` and ``edge_labels``.
+    Expects model.forward() to return ``edge_pred`` and ``edge_labels``,
+    OR use ``head=`` to route through an EdgeRegressionHead on top of model.encode().
+
+    Args:
+        head: optional EdgeRegressionHead — when set, calls model.encode() + head().
     """
+
+    def __init__(self, head=None):
+        self.head = head
 
     def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
         model.eval()
+        if self.head is not None:
+            self.head.eval()
         all_preds, all_labels = [], []
 
         with torch.no_grad():
             for raw_batch in eval_batches:
                 prepared = pipeline.prepare(raw_batch)
-                out = model(prepared)
+                if self.head is not None:
+                    bundle = model.encode(prepared)
+                    out = self.head(bundle.src, labels=prepared.edge_labels, dst_emb=bundle.dst)
+                else:
+                    out = model(prepared)
                 if out.edge_pred is None or out.edge_labels is None:
                     continue
                 all_preds.append(out.edge_pred.cpu())
@@ -447,22 +470,34 @@ class AnomalyEval(EvalProtocol):
     Expects model.forward() to return ``anomaly_score`` (B,) and ``node_labels``
     (0=normal, 1=anomaly) — or ``edge_labels`` for edge-level anomalies.
 
+    When ``head=`` is provided (multi-task mode), calls model.encode() + head()
+    instead of model(). Note: unsupervised mode returns {} without labels.
+
     Args:
         label_source: "node" (uses node_labels) or "edge" (uses edge_labels).
+        head: optional AnomalyDetectionHead (multi-task encode+head routing).
     """
 
-    def __init__(self, label_source: str = "node"):
+    def __init__(self, label_source: str = "node", head=None):
         assert label_source in ("node", "edge")
         self.label_source = label_source
+        self.head = head
 
     def evaluate(self, model, pipeline, eval_batches, graph) -> dict[str, float]:
         model.eval()
+        if self.head is not None:
+            self.head.eval()
         all_scores, all_labels = [], []
 
         with torch.no_grad():
             for raw_batch in eval_batches:
                 prepared = pipeline.prepare(raw_batch)
-                out = model(prepared)
+                if self.head is not None:
+                    bundle = model.encode(prepared)
+                    labels_in = prepared.node_labels if self.label_source == "node" else prepared.edge_labels
+                    out = self.head(bundle.src, labels=labels_in)
+                else:
+                    out = model(prepared)
                 if out.anomaly_score is None:
                     continue
                 labels_tensor = out.node_labels if self.label_source == "node" else out.edge_labels
