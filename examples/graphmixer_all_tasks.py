@@ -35,6 +35,7 @@ from tgengine import (
     TrainConfig,
     ThreeWayEval,
     load_dataset,
+    prepare_ranking_negs,
 )
 from tgengine.engine import Engine
 from tgengine.engine.eval import EdgeRegEval, AnomalyEval
@@ -144,12 +145,14 @@ def main():
     anomaly_head  = AnomalyDetectionHead(d_model=args.d_model, mode="unsupervised")
     node_cls_head = NodeClassificationHead(d_model=args.d_model, num_classes=3)
 
-    # --- random neg candidates for MRR (UCI has no pre-computed lists) ---
-    # Engine reuses the same MRREval for val and test, so size must cover both.
-    n_mrr_neg = 49
-    mrr_size = max(dataset.val_size, dataset.test_size)
-    torch.manual_seed(0)
-    mrr_neg = torch.randint(0, N, (mrr_size, n_mrr_neg))
+    # --- neg candidates for MRR eval (cached for reproducibility) ---
+    # size = max(val, test) so the same tensor covers both eval splits
+    mrr_neg = prepare_ranking_negs(
+        num_nodes=N,
+        size=max(dataset.val_size, dataset.test_size),
+        n_neg=49,
+        cache_path=f"neg_cache/{args.dataset}_mrr49.pt",
+    )
 
     # --- eval protocols ---
     # head= routes through model.encode() + head() for downstream task eval
