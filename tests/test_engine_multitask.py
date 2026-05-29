@@ -146,6 +146,7 @@ def _make_engine_with_tasks(tasks, task_weights=None):
     # Instead we test the routing logic directly by calling internal methods.
     engine = object.__new__(Engine)
     engine._tasks = tasks
+    engine._task_batches = {k: None for k in tasks}  # all tasks share batches
     engine._task_weights = task_weights or {}
     engine.model = _TinyModel(d=8)
     engine._use_tasks = True

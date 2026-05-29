@@ -9,6 +9,10 @@ class TrainConfig:
     epochs: int = 100
     batch_size: int = 200
     lr: float = 1e-4
+    # Optional separate learning rate for task heads.
+    # When set, encoder (model) uses `lr` and heads use `head_lr`.
+    # When None, all parameters share `lr`.
+    head_lr: Optional[float] = None
     patience: int = 0
     device: str = "cuda"
     seed: int = 42
@@ -25,6 +29,11 @@ class TrainConfig:
     min_eval_gap: int = 1
     max_eval_gap: int = 10
     loss_threshold: float = 0.02
+
+    # Multi-task early stopping rule:
+    #   "primary"     — stop when primary_metric stops improving (default)
+    #   "all_improve" — stop only when ALL tracked val metrics stop improving
+    stopping_rule: Literal["primary", "all_improve"] = "primary"
 
     # Logging & tracking
     wandb_project: Optional[str] = None

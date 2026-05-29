@@ -4,7 +4,7 @@ import json
 import math
 import os
 import time as time_module
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -106,7 +106,7 @@ class Engine:
         eval_protocol: Optional[EvalProtocol] = None,
         config: Optional[TrainConfig] = None,
         # --- multi-task ---
-        tasks: Optional[Dict[str, TaskHead]] = None,
+        tasks: Optional[Dict[str, Union[TaskHead, Tuple[TaskHead, List[RawBatch]]]]] = None,
         task_weights: Optional[Dict[str, float]] = None,
         eval_protocols: Optional[Dict[str, EvalProtocol]] = None,
         primary_metric: Optional[str] = None,
@@ -140,10 +140,21 @@ class Engine:
         self.config = config
         self.inductive_edges = inductive_edges
 
-        # Task heads (optional multi-task)
+        # Task heads (optional multi-task).
+        # Each entry can be:
+        #   TaskHead                        — shares train_batches
+        #   (TaskHead, List[RawBatch])      — uses its own batch source
         self._tasks: Dict[str, TaskHead] = {}
+        self._task_batches: Dict[str, Optional[List[RawBatch]]] = {}
         if tasks:
-            self._tasks = {k: v.to(config.device) for k, v in tasks.items()}
+            for k, v in tasks.items():
+                if isinstance(v, tuple):
+                    head, extra_batches = v
+                    self._tasks[k] = head.to(config.device)
+                    self._task_batches[k] = extra_batches
+                else:
+                    self._tasks[k] = v.to(config.device)
+                    self._task_batches[k] = None
         self._task_weights: Dict[str, float] = task_weights or {}
         self._primary_metric = primary_metric or self._infer_primary_metric()
         self._use_tasks = bool(self._tasks)
@@ -182,11 +193,19 @@ class Engine:
         self._eval_graph.freeze_csr()
         self._eval_pipeline = DataPipeline(model.gather_spec, self._eval_graph)
 
-        # Optimizer covers model + all task heads
-        all_params = list(model.parameters())
-        for head in self._tasks.values():
-            all_params.extend(head.parameters())
-        self.optimizer = torch.optim.Adam(all_params, lr=config.lr)
+        # Optimizer: encoder and heads can use different LRs
+        if config.head_lr is not None and self._tasks:
+            param_groups = [
+                {"params": list(model.parameters()), "lr": config.lr},
+                {"params": [p for h in self._tasks.values() for p in h.parameters()],
+                 "lr": config.head_lr},
+            ]
+            self.optimizer = torch.optim.Adam(param_groups)
+        else:
+            all_params = list(model.parameters())
+            for head in self._tasks.values():
+                all_params.extend(head.parameters())
+            self.optimizer = torch.optim.Adam(all_params, lr=config.lr)
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
         self.scheduler = self._build_scheduler() if config.warmup_steps > 0 else None
         if config.compile_model:
@@ -252,7 +271,11 @@ class Engine:
         return self.model(prepared)
 
     def _step_multitask(self, prepared) -> ModelOutput:
-        """Multi-task step: encode() → route embeddings to each head → sum losses."""
+        """Multi-task step: encode() → route shared heads → sum losses.
+
+        Heads with independent batch sources are NOT run here; they are stepped
+        separately in _train_epoch_sync via _step_independent_heads().
+        """
         bundle: EmbeddingBundle = self.model.encode(prepared)
 
         total_loss = torch.tensor(0.0, device=bundle.src.device)
@@ -263,6 +286,8 @@ class Engine:
         )
 
         for name, head in self._tasks.items():
+            if self._task_batches.get(name) is not None:
+                continue  # independent-batch heads handled separately
             w = self._task_weights.get(name, 1.0)
             out = self._route_to_head(head, name, bundle, prepared)
             total_loss = total_loss + w * out.loss
@@ -282,6 +307,31 @@ class Engine:
 
         merged.loss = total_loss
         return merged
+
+    def _step_independent_heads(self, step_idx: int) -> torch.Tensor:
+        """Run heads that have their own batch sources.
+
+        Cycles through the head's batch list using step_idx % len(batches).
+        Returns the weighted sum of their losses (scalar tensor).
+        """
+        total = torch.tensor(0.0, device=self.config.device)
+        for name, head in self._tasks.items():
+            extra = self._task_batches.get(name)
+            if extra is None or len(extra) == 0:
+                continue
+            rb = extra[step_idx % len(extra)]
+            # Encode src nodes from the independent batch
+            neg = self.neg_strategy.sample(rb.src, rb.dst, rb.time, self.graph,
+                                            rb.edge_indices)
+            rb_with_neg = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
+                                   edge_feat=rb.edge_feat, neg=neg,
+                                   edge_indices=rb.edge_indices)
+            prep = self.pipeline.prepare(rb_with_neg)
+            bundle = self.model.encode(prep)
+            w = self._task_weights.get(name, 1.0)
+            out = self._route_to_head(head, name, bundle, prep)
+            total = total + w * out.loss
+        return total
 
     def _route_to_head(self, head: TaskHead, name: str, bundle: EmbeddingBundle, prepared) -> ModelOutput:
         """Route embeddings to a task head, passing the right kwargs per head type."""
@@ -371,6 +421,8 @@ class Engine:
         best_epoch = 0
         patience_counter = 0
         eval_count = 0
+        # For "all_improve" rule: track per-metric best values
+        _all_improve_bests: dict[str, float] = {}
         t_start = time_module.time()
 
         for epoch in range(self._current_epoch + 1, self.config.epochs + 1):
@@ -397,7 +449,23 @@ class Engine:
                 if val_score == 0.0 and val_metrics:
                     val_score = next(iter(val_metrics.values()))
 
-                is_best = val_score > best_val
+                # Determine is_best based on stopping_rule
+                if self.config.stopping_rule == "all_improve":
+                    if not _all_improve_bests:
+                        # First eval — initialize and treat as best
+                        _all_improve_bests = dict(val_metrics)
+                        is_best = True
+                    else:
+                        # Best only if EVERY tracked metric improved or held
+                        is_best = all(
+                            val_metrics.get(k, 0.0) >= _all_improve_bests.get(k, 0.0)
+                            for k in _all_improve_bests
+                        )
+                        if is_best:
+                            _all_improve_bests.update(val_metrics)
+                else:
+                    is_best = val_score > best_val
+
                 if is_best:
                     best_val = val_score
                     self._best_val = best_val
@@ -484,7 +552,7 @@ class Engine:
     def _train_epoch_sync(self) -> float:
         total_loss = 0.0
         amp_enabled = self.config.use_amp
-        for raw_batch in tqdm(self.train_batches, desc="Training"):
+        for step_idx, raw_batch in enumerate(tqdm(self.train_batches, desc="Training")):
             neg = self.neg_strategy.sample(
                 raw_batch.src, raw_batch.dst, raw_batch.time, self.graph,
                 raw_batch.edge_indices,
@@ -494,7 +562,13 @@ class Engine:
             self.optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 output = self._step(prepared)
-            self.scaler.scale(output.loss).backward()
+                # Add loss from independent-batch heads (if any)
+                if self._use_tasks:
+                    indep_loss = self._step_independent_heads(step_idx)
+                    total_step_loss = output.loss + indep_loss
+                else:
+                    total_step_loss = output.loss
+            self.scaler.scale(total_step_loss).backward()
             if self.config.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
@@ -505,7 +579,7 @@ class Engine:
             self.scaler.update()
             if self.scheduler is not None:
                 self.scheduler.step()
-            total_loss += output.loss.item()
+            total_loss += total_step_loss.item()
             self.model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
         return total_loss
 
@@ -573,6 +647,73 @@ class Engine:
         for head in self._tasks.values():
             head.train()
         return all_metrics
+
+    # ------------------------------------------------------------------
+    # Probe mode: freeze encoder, train only task heads
+    # ------------------------------------------------------------------
+
+    def probe(
+        self,
+        task_name: str,
+        epochs: int = 20,
+        lr: Optional[float] = None,
+    ) -> dict[str, float]:
+        """Freeze the encoder and train only the named task head.
+
+        This is the standard "linear probing" evaluation: representation
+        quality is measured by how well a freshly-trained head performs
+        on top of a frozen encoder.
+
+        Args:
+            task_name: Key in `self._tasks` to probe.
+            epochs: Number of epochs to train the head.
+            lr: Learning rate for the head (defaults to config.head_lr or config.lr).
+
+        Returns:
+            Val metrics dict after probe training.
+        """
+        if task_name not in self._tasks:
+            raise ValueError(f"Task '{task_name}' not found. Available: {list(self._tasks)}")
+
+        head = self._tasks[task_name]
+        head_lr = lr or self.config.head_lr or self.config.lr
+
+        # Freeze encoder
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        head_params = list(head.parameters())
+        has_params = len(head_params) > 0
+        if has_params:
+            probe_opt = torch.optim.Adam(head_params, lr=head_lr)
+        amp_enabled = self.config.use_amp
+
+        head.train()
+        for _ in range(epochs):
+            for step_idx, raw_batch in enumerate(self.train_batches):
+                neg = self.neg_strategy.sample(
+                    raw_batch.src, raw_batch.dst, raw_batch.time, self.graph,
+                    raw_batch.edge_indices,
+                )
+                raw_batch.neg = neg
+                prepared = self.pipeline.prepare(raw_batch)
+
+                if has_params:
+                    probe_opt.zero_grad()
+                # No torch.no_grad() here: encoder params are frozen (requires_grad=False)
+                # but the computation graph still needs to flow through head params.
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    bundle = self.model.encode(prepared)
+                    out = self._route_to_head(head, task_name, bundle, prepared)
+                if has_params and out.loss.requires_grad:
+                    out.loss.backward()
+                    probe_opt.step()
+
+        # Unfreeze encoder
+        for p in self.model.parameters():
+            p.requires_grad_(True)
+
+        return self._evaluate(self.val_batches)
 
 
 def run_experiment(
