@@ -54,3 +54,16 @@ class ConcatMLPDecoder(nn.Module):
     def forward(self, src_emb: Tensor, dst_emb: Tensor) -> Tensor:
         combined = torch.cat([src_emb, dst_emb], dim=-1)
         return self.mlp(combined).squeeze(-1)
+
+
+class ConcatDecoder(nn.Module):
+    """DyGLib MergeLayer: cat(src, dst) -> Linear(2d, d) -> ReLU -> Linear(d, 1)."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model * 2, d_model)
+        self.fc2 = nn.Linear(d_model, 1)
+
+    def forward(self, src_emb: Tensor, dst_emb: Tensor) -> Tensor:
+        x = torch.cat([src_emb, dst_emb], dim=-1)
+        return self.fc2(torch.relu(self.fc1(x))).squeeze(-1)

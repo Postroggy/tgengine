@@ -1,5 +1,5 @@
 from .co_neighbor import CoNeighborEncoder
-from .decoder import BilinearDecoder, ConcatMLPDecoder, MergeDecoder
+from .decoder import BilinearDecoder, ConcatDecoder, ConcatMLPDecoder, MergeDecoder
 from .memory import NodeMemory
 from .mlp_mixer import FeedForwardNet, FilterLayer, FreeDyGMixerLayer, MLPMixerLayer
 from .seq_encoder import (
@@ -14,6 +14,7 @@ from .time_encoding import FixedCosineTimeEncoder, HarmonicEncoder, Time2Vec
 __all__ = [
     "BilinearDecoder",
     "CoNeighborEncoder",
+    "ConcatDecoder",
     "ConcatMLPDecoder",
     "FixedCosineTimeEncoder",
     "FeedForwardNet",

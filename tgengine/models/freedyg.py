@@ -25,7 +25,7 @@ from torch import Tensor
 from tgengine.core.batch import NeighborData, PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
 from tgengine.models.base import ModelOutput, TemporalModel
-from tgengine.nn import HarmonicEncoder, MergeDecoder
+from tgengine.nn import FixedCosineTimeEncoder, MergeDecoder
 from tgengine.nn.mlp_mixer import FreeDyGMixerLayer
 
 PADDING_ID = -1
@@ -123,7 +123,7 @@ class FreeDyG(TemporalModel):
             co_occurrence=False,  # NIF computed internally from neighbor_ids
         )
 
-        self.time_enc = HarmonicEncoder(d_time)
+        self.time_enc = FixedCosineTimeEncoder(d_time, learnable=False)
         self.nif_enc = _NIFEncoder(d_nif)
 
         # Channel projections → d_edge each (as in reference)
@@ -187,6 +187,10 @@ class FreeDyG(TemporalModel):
         b_dt = time.unsqueeze(1).float() - b_nbrs.timestamps.float()
         a_t = self.time_enc(a_dt)   # (B, K, d_time)
         b_t = self.time_enc(b_dt)
+
+        # Zero out time features for padding positions (DyGLib semantics)
+        a_t = a_t.masked_fill(~a_nbrs.mask.unsqueeze(-1), 0.0)
+        b_t = b_t.masked_fill(~b_nbrs.mask.unsqueeze(-1), 0.0)
 
         # NIF features (vectorized co-occurrence)
         a_nif, b_nif = self.nif_enc(a_nbrs.neighbor_ids, b_nbrs.neighbor_ids,

@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from tgengine.utils import load_config, merge_config, seed_everything
+from tgengine.utils.logging import check_gpu_memory
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +191,11 @@ def train_from_config(cfg: dict) -> dict[str, float]:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {cfg['model']['name']} — {n_params:,} params")
 
+    # GPU memory warning
+    warning = check_gpu_memory(ds.num_nodes, K, ds.edge_feat_dim, device)
+    if warning:
+        print(f"⚠ {warning}")
+
     # --- Graph ---
     graph = TemporalGraph(ds.num_nodes, edge_feat_dim=ds.edge_feat_dim, device=device)
 
@@ -230,12 +236,10 @@ def train_from_config(cfg: dict) -> dict[str, float]:
         eval_protocol=eval_protocol,
         config=config,
     )
+    engine.logger.dataset_name = data_cfg['dataset']
 
     # --- Train ---
-    print(f"\nTraining: epochs={config.epochs}, patience={config.patience}, "
-          f"amp={config.use_amp}, grad_clip={config.grad_clip}")
     best = engine.train()
-    print(f"\nBest test metrics: {best}")
     return best
 
 

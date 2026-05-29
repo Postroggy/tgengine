@@ -36,7 +36,7 @@ from torch import Tensor
 from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
 from tgengine.models.base import ModelOutput, TemporalModel
-from tgengine.nn import FixedCosineTimeEncoder, MergeDecoder
+from tgengine.nn import ConcatDecoder, FixedCosineTimeEncoder, MergeDecoder
 from tgengine.nn.mlp_mixer import MLPMixerLayer
 
 
@@ -77,7 +77,7 @@ class GraphMixer(TemporalModel):
         )
 
         # Fixed cosine time encoding matching DyGLib's GraphMixer exactly
-        self.time_enc = FixedCosineTimeEncoder(d_time)
+        self.time_enc = FixedCosineTimeEncoder(d_time, learnable=False)
 
         # num_channels = edge_feat_dim (as in reference)
         num_channels = d_edge
@@ -103,7 +103,7 @@ class GraphMixer(TemporalModel):
         self.d_node = d_node
 
         self.output_layer = nn.Linear(num_channels + d_node, d_model, bias=True)
-        self.decoder = MergeDecoder(d_model)
+        self.decoder = ConcatDecoder(d_model)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
         src_emb = self._encode(batch.src, batch.src_neighbors, batch.time)
@@ -112,8 +112,9 @@ class GraphMixer(TemporalModel):
 
         pos_score = self.decoder(src_emb, dst_emb)
         neg_score = self.decoder(src_emb, neg_emb)
-        loss = F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score))
-        loss = loss + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
+        scores = torch.cat([pos_score, neg_score], dim=0)
+        labels = torch.cat([torch.ones_like(pos_score), torch.zeros_like(neg_score)], dim=0)
+        loss = F.binary_cross_entropy_with_logits(scores, labels)
         return ModelOutput(loss=loss, pos_score=pos_score, neg_score=neg_score)
 
     def _encode(self, nodes: Tensor, nbrs, query_times: Tensor) -> Tensor:
@@ -121,6 +122,10 @@ class GraphMixer(TemporalModel):
         # ---- link encoder ----
         dt = query_times.unsqueeze(1).float() - nbrs.timestamps.float()  # (B, K)
         t_feat = self.time_enc(dt)                                        # (B, K, d_time)
+
+        # Zero out time features for padding positions (DyGLib: neighbor_node_ids == 0)
+        pad_mask = ~nbrs.mask  # True where padding
+        t_feat = t_feat.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
         combined = torch.cat([nbrs.edge_feats, t_feat], dim=-1)           # (B, K, d_edge+d_time)
         tokens = self.projection(combined)                                  # (B, K, num_channels)
@@ -153,7 +158,7 @@ class GraphMixer(TemporalModel):
         # If all neighbors padding, softmax still runs but on -1e10 — handle with clamp
         scores = mask_float.masked_fill(~nbrs.mask, -1e10)                # (B, K)
         attn = torch.softmax(scores, dim=1)                               # (B, K)
-        agg = (nbr_feats * attn.unsqueeze(-1)).sum(dim=1)                 # (B, d_node)
+        agg = (nbr_feats * attn.unsqueeze(-1)).mean(dim=1)                # (B, d_node)
 
         # Add query node's own features
         own_feat = self.node_raw_features[(nodes.long() + 1).clamp(min=0)]  # (B, d_node)

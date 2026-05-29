@@ -24,6 +24,7 @@ from tgengine.pipeline.negatives import (
     NegativeStrategy,
     RandomNegative,
 )
+from tgengine.utils.logging import TrainLogger, validate_config
 
 
 @dataclass
@@ -85,7 +86,6 @@ class APEval(EvalProtocol):
                 output = model(prepared)
                 all_pos_scores.append(output.pos_score)
                 all_neg_scores.append(output.neg_score)
-                graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
 
         pos = torch.cat(all_pos_scores).sigmoid()
         neg = torch.cat(all_neg_scores).sigmoid()
@@ -139,7 +139,6 @@ class ThreeWayEval(EvalProtocol):
                     output = model(prepared)
                     all_pos_scores.append(output.pos_score)
                     all_neg_scores.append(output.neg_score)
-                    graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
 
             pos = torch.cat(all_pos_scores).sigmoid()
             neg_scores = torch.cat(all_neg_scores).sigmoid()
@@ -182,7 +181,6 @@ class MRREval(EvalProtocol):
                     rr = self._mrr_pairwise(model, pipeline, raw_batch, neg)
 
                 all_rr.append(rr)
-                graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
 
         return {"mrr": torch.cat(all_rr).mean().item()}
 
@@ -285,7 +283,6 @@ class HitsEval(EvalProtocol):
                     rr = self._rank_pairwise(model, pipeline, raw_batch, neg)
 
                 all_ranks.append(rr)
-                graph.advance(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
 
         ranks = torch.cat(all_ranks)  # (N,) 1-indexed ranks
         results = {}
@@ -359,15 +356,25 @@ class Engine:
         neg_strategy: NegativeStrategy,
         eval_protocol: EvalProtocol,
         config: TrainConfig,
+        inductive_edges: Optional[dict] = None,
+        eval_neg_strategy: Optional[NegativeStrategy] = None,
     ):
+        validate_config(config)
+
         self.model = model.to(config.device)
         self.graph = graph
         self.train_batches = train_batches
         self.val_batches = val_batches
         self.test_batches = test_batches
         self.neg_strategy = neg_strategy
+        self.eval_neg_strategy = eval_neg_strategy or neg_strategy
         self.eval_protocol = eval_protocol
         self.config = config
+        self.inductive_edges = inductive_edges
+        self.logger = TrainLogger(
+            model_name=model.__class__.__name__,
+            dataset_name="",
+        )
 
         self.pipeline = DataPipeline(model.gather_spec, graph)
         self.async_pipeline = (
@@ -379,6 +386,26 @@ class Engine:
         for rb in train_batches:
             graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
         graph.freeze_csr()
+
+        # Build eval graph once: full CSR with ALL edges (train+val+test+inductive).
+        # DyGLib uses full_neighbor_sampler during eval — overflow ring buffer can't
+        # hold enough edges for popular nodes, so we freeze everything into CSR.
+        self._eval_graph = TemporalGraph(
+            graph.num_nodes, edge_feat_dim=graph.edge_feat_dim,
+            device=config.device,
+            buffer_size=model.gather_spec.neighbors.k if model.gather_spec.neighbors else 32,
+        )
+        for rb in train_batches + val_batches + test_batches:
+            self._eval_graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
+        if inductive_edges is not None:
+            ie = inductive_edges
+            self._eval_graph.advance(
+                ie["src"].to(config.device), ie["dst"].to(config.device),
+                ie["time"].to(config.device),
+                ie["edge_feat"].to(config.device) if ie["edge_feat"] is not None else None,
+            )
+        self._eval_graph.freeze_csr()
+        self._eval_pipeline = DataPipeline(model.gather_spec, self._eval_graph)
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
@@ -459,32 +486,45 @@ class Engine:
         If config.checkpoint_dir is set, automatically saves the best
         checkpoint to ``{checkpoint_dir}/best.pt``.
         """
+        self.logger.log_start(self.config)
         best_val = self._best_val if resume else 0.0
         best_test: dict[str, float] = {}
         patience_counter = 0
 
         for epoch in range(self._current_epoch + 1, self.config.epochs + 1):
             self._current_epoch = epoch
-            train_loss = self._train_epoch()
+            self.logger.epoch_start()
+
+            try:
+                train_loss = self._train_epoch()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    f"CUDA OOM at epoch {epoch}. Try reducing batch_size "
+                    f"(current: {self.config.batch_size}) or neighbor K."
+                )
 
             # Evaluate
             val_metrics = self._evaluate(self.val_batches)
             val_score = val_metrics.get("ap", val_metrics.get("mrr", 0.0))
 
-            if val_score > best_val:
+            is_best = val_score > best_val
+            if is_best:
                 best_val = val_score
                 self._best_val = best_val
                 best_test = self._evaluate(self.test_batches)
                 patience_counter = 0
 
-                # Auto-save best checkpoint
                 if self.config.checkpoint_dir is not None:
                     save_path = os.path.join(self.config.checkpoint_dir, "best.pt")
                     self.save_checkpoint(save_path)
-                print(f"  Epoch {epoch}: loss={train_loss:.4f} val={val_score:.4f} test={best_test} *")
             else:
                 patience_counter += 1
-                print(f"  Epoch {epoch}: loss={train_loss:.4f} val={val_score:.4f} patience={patience_counter}")
+
+            self.logger.epoch_end(
+                epoch, train_loss, val_score, is_best,
+                best_test=best_test, patience_counter=patience_counter,
+            )
 
             if self._wandb:
                 log = {"epoch": epoch, "train_loss": train_loss, "val_score": val_score}
@@ -497,6 +537,7 @@ class Engine:
             if patience_counter >= self.config.patience:
                 break
 
+        self.logger.log_finish(best_test, self._current_epoch)
         if self._wandb:
             self._wandb.finish()
         return best_test
@@ -575,26 +616,14 @@ class Engine:
         return total_loss
 
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
-        """Run evaluation with proper snapshot/restore.
-
-        Preloads ALL val+test edges into graph before evaluation to match DyGLib's
-        full_neighbor_sampler semantics (eval sees all edges in the dataset).
-        """
-        graph_snap = self.graph.snapshot()
+        """Run evaluation using pre-built full-data eval graph."""
         model_state = self.model.freeze()
 
-        # Preload all val+test edges so neighbor queries see full dataset (DyGLib semantics)
-        for rb in self.val_batches:
-            self.graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
-        for rb in self.test_batches:
-            self.graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
-
-        # Ensure every eval batch has negatives sampled (use train neg strategy)
         prepped = []
         for rb in eval_batches:
             if rb.neg is None:
-                neg = self.neg_strategy.sample(rb.src, rb.dst, rb.time, self.graph,
-                                                rb.edge_indices)
+                neg = self.eval_neg_strategy.sample(rb.src, rb.dst, rb.time,
+                                                    self._eval_graph, rb.edge_indices)
                 rb = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
                               edge_feat=rb.edge_feat, neg=neg,
                               edge_indices=rb.edge_indices)
@@ -602,9 +631,8 @@ class Engine:
 
         with torch.amp.autocast("cuda", enabled=self.config.use_amp):
             metrics = self.eval_protocol.evaluate(
-                self.model, self.pipeline, prepped, self.graph
+                self.model, self._eval_pipeline, prepped, self._eval_graph
             )
 
-        self.graph.restore(graph_snap)
         self.model.thaw(model_state)
         return metrics

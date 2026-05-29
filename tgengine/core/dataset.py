@@ -52,6 +52,10 @@ class TemporalDataset:
     new_node_val_mask: Optional[Tensor] = None   # bool (N,)
     new_node_test_mask: Optional[Tensor] = None  # bool (N,)
 
+    # Edges filtered from training (new_test_node edges in train time window)
+    # These must be loaded into graph during eval to match DyGLib's full_neighbor_sampler
+    inductive_edges: Optional[dict] = None  # {src, dst, time, edge_feat} Tensors
+
     @property
     def edge_feat_dim(self) -> int:
         return self.edge_feat.shape[1] if self.edge_feat is not None else 0
@@ -198,6 +202,18 @@ def load_dataset(
         np.where(test_mask)[0],
     ])
 
+    # Edges filtered from training but needed for eval (DyGLib full_neighbor_sampler)
+    inductive_train_mask = (time_vals <= val_time) & ~observed_mask
+    inductive_idx = np.where(inductive_train_mask)[0]
+    if len(inductive_idx) > 0:
+        ind_src = torch.from_numpy(src[inductive_idx]).long()
+        ind_dst = torch.from_numpy(dst[inductive_idx]).long()
+        ind_time = torch.from_numpy(time_vals[inductive_idx]).double()
+        ind_ef = edge_feat[inductive_idx] if edge_feat is not None else None
+        inductive_edges = {"src": ind_src, "dst": ind_dst, "time": ind_time, "edge_feat": ind_ef}
+    else:
+        inductive_edges = None
+
     src_t = torch.from_numpy(src[order]).long()
     dst_t = torch.from_numpy(dst[order]).long()
     time_t = torch.from_numpy(time_vals[order]).double()
@@ -247,6 +263,7 @@ def load_dataset(
         val_end=val_end,
         new_node_val_mask=new_node_val_t,
         new_node_test_mask=new_node_test_t,
+        inductive_edges=inductive_edges,
     )
 
 
