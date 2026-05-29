@@ -46,26 +46,6 @@ Existing CTDG frameworks make you choose between **research flexibility** and **
 
 TGEngine refuses the tradeoff:
 
-```mermaid
-graph LR
-    subgraph DyGLib["❌ DyGLib"]
-        direction TB
-        M1[Model Code] <-->|tangled| T1[Train Script]
-        T1 -->|CPU loop| P1[Data Pipeline]
-        P1 -->|numpy→GPU each step| G1[GPU]
-    end
-
-    subgraph TGEngine["✅ TGEngine"]
-        direction TB
-        M2[Model\nGatherSpec + forward] -->|PreparedBatch| E2[Engine]
-        E2 -->|fused kernel| P2[DataPipeline\nGPU-resident]
-        P2 -.->|async prefetch| P2
-    end
-
-    style DyGLib fill:#fee2e2,stroke:#ef4444,color:#111
-    style TGEngine fill:#dcfce7,stroke:#22c55e,color:#111
-```
-
 |  | DyGLib | TGM | **TGEngine** |
 |---|:---:|:---:|:---:|
 | Add new model | Modify 500-line train script | Encoder + hook + example | **~60 lines, 1 class** |
