@@ -175,12 +175,12 @@ block-beta
   E["Layer 1 · Engine\nTrainLoop · AdaptiveEval · AP / AUC / MRR / Hits@K · Stateful lifecycle"]
   F["🗄  Storage · TemporalGraph\nGPU-resident circular buffer · O(1) append · O(1) recent-k query"]
 
-  style A fill:#6366f1,color:#fff,stroke:#4338ca
-  style B fill:#8b5cf6,color:#fff,stroke:#7c3aed
-  style C fill:#a855f7,color:#fff,stroke:#9333ea
-  style D fill:#ec4899,color:#fff,stroke:#db2777
-  style E fill:#f43f5e,color:#fff,stroke:#e11d48
-  style F fill:#334155,color:#fff,stroke:#1e293b
+  style A fill:#eef2ff,color:#3730a3,stroke:#a5b4fc
+  style B fill:#f5f3ff,color:#4c1d95,stroke:#c4b5fd
+  style C fill:#faf5ff,color:#6b21a8,stroke:#d8b4fe
+  style D fill:#fdf2f8,color:#9d174d,stroke:#f9a8d4
+  style E fill:#fff1f2,color:#9f1239,stroke:#fca5a5
+  style F fill:#f1f5f9,color:#1e293b,stroke:#cbd5e1
 ```
 
 ### The Core Idea: GatherSpec → PreparedBatch
