@@ -37,6 +37,7 @@ from .tasks import (
     NodeRegressionHead,
     TaskHead,
 )
+from .pipeline import DataPipeline
 from .pipeline.async_pipeline import AsyncDataPipeline
 from .models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from .models.dygformer import DyGFormer
@@ -81,6 +82,7 @@ __all__ = [
     "AUCEval",
     "AnomalyEval",
     "AsyncDataPipeline",
+    "DataPipeline",
     "EdgeClsEval",
     "EdgeRegEval",
     "Engine",

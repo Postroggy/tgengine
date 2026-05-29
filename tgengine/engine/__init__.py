@@ -600,7 +600,12 @@ class Engine:
             self.optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 output = self._step(prepared)
-            self.scaler.scale(output.loss).backward()
+                if self._use_tasks:
+                    indep_loss = self._step_independent_heads(i)
+                    total_step_loss = output.loss + indep_loss
+                else:
+                    total_step_loss = output.loss
+            self.scaler.scale(total_step_loss).backward()
             if self.config.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
@@ -611,7 +616,7 @@ class Engine:
             self.scaler.update()
             if self.scheduler is not None:
                 self.scheduler.step()
-            total_loss += output.loss.item()
+            total_loss += total_step_loss.item()
             self.model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
 
             if i + 1 < len(batches):

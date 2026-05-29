@@ -39,3 +39,10 @@ class TrainConfig:
     wandb_project: Optional[str] = None
     wandb_run_name: Optional[str] = None
     result_dir: Optional[str] = None
+
+    def __post_init__(self):
+        if self.use_amp and not self.device.startswith("cuda"):
+            raise ValueError(
+                f"use_amp=True requires a CUDA device, but device='{self.device}'. "
+                "Set use_amp=False when running on CPU."
+            )

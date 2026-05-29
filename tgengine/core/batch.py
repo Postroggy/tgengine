@@ -77,9 +77,9 @@ class PreparedBatch:
     neg: Tensor  # (B,) or (B, N_neg)
     time: Tensor  # (B,)
 
-    src_neighbors: NeighborData  # neighbors of src nodes
-    dst_neighbors: NeighborData  # neighbors of dst nodes
-    neg_neighbors: NeighborData  # neighbors of neg dst nodes
+    src_neighbors: Optional[NeighborData]  # neighbors of src nodes
+    dst_neighbors: Optional[NeighborData]  # neighbors of dst nodes
+    neg_neighbors: Optional[NeighborData]  # neighbors of neg dst nodes
     neg_src_neighbors: Optional[NeighborData] = None  # neighbors of neg src nodes (random-edge neg)
 
     neg_src: Optional[Tensor] = None  # (B,) negative src node IDs (random-edge neg)
