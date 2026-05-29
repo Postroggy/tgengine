@@ -24,7 +24,7 @@ from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
 from tgengine.models.base import ModelOutput, TemporalModel
 from tgengine.core.batch import NeighborData
-from tgengine.nn import FixedCosineTimeEncoder
+from tgengine.nn import FixedCosineTimeEncoder, TransformerBlock
 
 PADDING_ID = -1
 
@@ -127,31 +127,6 @@ class _CoOccurrenceEncoder(nn.Module):
         return a_freq, b_freq
 
 
-class _TransformerLayer(nn.Module):
-    """Single DyGFormer transformer layer (pre-LN, batch_first)."""
-
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # Pre-LN attention
-        h, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
-        x = x + self.drop(h)
-        # Pre-LN FFN
-        x = x + self.drop(self.ff(self.norm2(x)))
-        return x
-
-
 class DyGFormer(TemporalModel):
     """DyGFormer model for link prediction in continuous-time dynamic graphs.
 
@@ -226,7 +201,7 @@ class DyGFormer(TemporalModel):
 
         d_joint = self.n_channels * d_channel
         self.layers = nn.ModuleList([
-            _TransformerLayer(d_joint, n_heads, dropout) for _ in range(n_layers)
+            TransformerBlock(d_joint, n_heads, dropout) for _ in range(n_layers)
         ])
         self.out_proj = nn.Linear(d_joint, d_model)
 

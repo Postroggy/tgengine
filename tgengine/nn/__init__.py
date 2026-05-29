@@ -10,6 +10,7 @@ from .seq_encoder import (
     TransformerSeqEncoder,
 )
 from .time_encoding import FixedCosineTimeEncoder, HarmonicEncoder, Time2Vec
+from .transformer import TransformerBlock
 
 __all__ = [
     "BilinearDecoder",
@@ -29,5 +30,6 @@ __all__ = [
     "NodeMemory",
     "SequenceEncoder",
     "Time2Vec",
+    "TransformerBlock",
     "TransformerSeqEncoder",
 ]

@@ -44,11 +44,11 @@ def _build_model(name: str, num_nodes: int, d_edge: int, K: int, node_feat=None,
         from tgengine.models.graphmixer import GraphMixer
         # Match DyGLib per-dataset config
         gm_cfg = {
-            "wikipedia": {"K": 30, "dropout": 0.1},
-            "reddit": {"K": 10, "dropout": 0.1},
-            "uci": {"K": 20, "dropout": 0.1},
-            "mooc": {"K": 20, "dropout": 0.1},
-            "lastfm": {"K": 10, "dropout": 0.1},
+            "wikipedia": {"K": 30, "dropout": 0.5},
+            "reddit": {"K": 10, "dropout": 0.5},
+            "uci": {"K": 20, "dropout": 0.4},
+            "mooc": {"K": 20, "dropout": 0.4},
+            "lastfm": {"K": 10, "dropout": 0.0},
         }.get(dataset_name, {"K": 20, "dropout": 0.1})
         return GraphMixer(d_model=172, d_edge=d_edge, d_time=100,
                           K=gm_cfg["K"], num_layers=2, dropout=gm_cfg["dropout"],

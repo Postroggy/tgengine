@@ -33,7 +33,8 @@ class TrainLogger:
             mem_total = torch.cuda.get_device_properties(0).total_memory / 1e9
             lines.append(f"  GPU: {gpu_name} ({mem_total:.1f} GB)")
         lines += [
-            f"  epochs: {config.epochs}, patience: {config.patience}",
+            f"  epochs: {config.epochs}, patience: {config.patience or 'off'}",
+            f"  eval: {config.eval_strategy}",
             f"  lr: {config.lr}, batch_size: {config.batch_size}",
             f"  amp: {config.use_amp}, grad_clip: {config.grad_clip}",
             "=" * 60,
@@ -47,7 +48,7 @@ class TrainLogger:
         self,
         epoch: int,
         train_loss: float,
-        val_score: float,
+        val_score: Optional[float],
         is_best: bool,
         best_test: Optional[dict] = None,
         patience_counter: int = 0,
@@ -58,7 +59,9 @@ class TrainLogger:
             mem_mb = torch.cuda.max_memory_allocated() / 1e6
             mem_str = f" mem={mem_mb:.0f}MB"
 
-        if is_best:
+        if val_score is None:
+            print(f"  Epoch {epoch}: loss={train_loss:.4f} {elapsed:.1f}s{mem_str}")
+        elif is_best:
             test_str = " ".join(f"{k}={v:.4f}" for k, v in (best_test or {}).items())
             print(f"  Epoch {epoch}: loss={train_loss:.4f} val={val_score:.4f} "
                   f"test=[{test_str}] {elapsed:.1f}s{mem_str} *")
@@ -79,8 +82,8 @@ def validate_config(config) -> None:
         raise ValueError(f"batch_size must be positive, got {config.batch_size}")
     if config.epochs <= 0:
         raise ValueError(f"epochs must be positive, got {config.epochs}")
-    if config.patience <= 0:
-        raise ValueError(f"patience must be positive, got {config.patience}")
+    if config.patience < 0:
+        raise ValueError(f"patience must be non-negative, got {config.patience}")
     if config.grad_clip < 0:
         raise ValueError(f"grad_clip must be non-negative, got {config.grad_clip}")
     if config.warmup_steps < 0:

@@ -1,7 +1,8 @@
 """End-to-end integration tests for the Engine training loop.
 
 Covers: training loss decrease, APEval via Engine, ThreeWayEval via Engine,
-MRREval slow path, snapshot/restore during eval, early stopping.
+MRREval slow path, snapshot/restore during eval, early stopping,
+adaptive eval, AUCEval, structured output.
 """
 
 import torch
@@ -10,7 +11,7 @@ import pytest
 from tgengine.core.batch import RawBatch
 from tgengine.core.temporal_graph import TemporalGraph
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-from tgengine.engine import Engine, TrainConfig, APEval, ThreeWayEval, MRREval
+from tgengine.engine import Engine, TrainConfig, APEval, AUCEval, ThreeWayEval, MRREval
 from tgengine.models.graphmixer import GraphMixer
 from tgengine.pipeline import DataPipeline
 from tgengine.pipeline.negatives import RandomNegative
@@ -335,3 +336,232 @@ def test_amp_training():
                     neg_strat, APEval(), config)
     best = engine.train()
     assert "ap" in best or best == {}
+
+
+def test_adaptive_eval_skips_epochs():
+    """Adaptive eval should evaluate fewer times than total epochs."""
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (50,), device=dev),
+        torch.randint(0, N, (50,), device=dev),
+        torch.linspace(0, 50, 50, dtype=torch.float64, device=dev),
+        torch.randn(50, d, device=dev),
+    )
+
+    train_batches = [RawBatch(
+        src=torch.randint(0, N, (8,), device=dev),
+        dst=torch.randint(0, N, (8,), device=dev),
+        time=torch.full((8,), 60.0 + i, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(8, d, device=dev),
+    ) for i in range(8)]
+    val_batches = test_batches = train_batches[4:8]
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    config = TrainConfig(
+        epochs=20, batch_size=8, lr=1e-3, patience=0, device=dev, seed=42,
+        eval_strategy="adaptive", max_eval_gap=5, loss_threshold=0.001,
+    )
+    engine = Engine(model, graph, train_batches, val_batches, test_batches,
+                    RandomNegative(N), APEval(), config)
+
+    # Track eval count via _last_eval_epoch
+    engine.train()
+    # With adaptive, should have evaluated < 20 times (at least first + last + a few)
+    assert engine._last_eval_epoch == 20
+
+
+def test_adaptive_should_eval_logic():
+    """Unit test for _should_eval method."""
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (50,), device=dev),
+        torch.randint(0, N, (50,), device=dev),
+        torch.linspace(0, 50, 50, dtype=torch.float64, device=dev),
+        torch.randn(50, d, device=dev),
+    )
+
+    train_batches = [RawBatch(
+        src=torch.randint(0, N, (4,), device=dev),
+        dst=torch.randint(0, N, (4,), device=dev),
+        time=torch.full((4,), 60.0, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(4, d, device=dev),
+    )]
+    val_batches = test_batches = train_batches
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    config = TrainConfig(
+        epochs=50, batch_size=4, lr=1e-3, patience=0, device=dev,
+        eval_strategy="adaptive", min_eval_gap=2, max_eval_gap=10,
+        loss_threshold=0.02,
+    )
+    engine = Engine(model, graph, train_batches, val_batches, test_batches,
+                    RandomNegative(N), APEval(), config)
+
+    # Epoch 1: always eval
+    assert engine._should_eval(1, 0.5) is True
+    # Last epoch: always eval
+    assert engine._should_eval(50, 0.5) is True
+
+    # Within min_eval_gap: skip
+    engine._last_eval_epoch = 5
+    engine._loss_at_last_eval = 0.5
+    assert engine._should_eval(6, 0.5) is False
+
+    # Beyond max_eval_gap: force eval
+    assert engine._should_eval(16, 0.5) is True
+
+    # Loss barely changed: skip
+    assert engine._should_eval(8, 0.505) is False
+
+    # Loss changed significantly: eval
+    assert engine._should_eval(8, 0.6) is True
+
+
+def test_eval_strategy_all():
+    """eval_strategy='all' evaluates every epoch."""
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (50,), device=dev),
+        torch.randint(0, N, (50,), device=dev),
+        torch.linspace(0, 50, 50, dtype=torch.float64, device=dev),
+        torch.randn(50, d, device=dev),
+    )
+
+    train_batches = [RawBatch(
+        src=torch.randint(0, N, (4,), device=dev),
+        dst=torch.randint(0, N, (4,), device=dev),
+        time=torch.full((4,), 60.0, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(4, d, device=dev),
+    )]
+    val_batches = test_batches = train_batches
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+    config = TrainConfig(
+        epochs=5, batch_size=4, lr=1e-3, patience=0, device=dev,
+        eval_strategy="all",
+    )
+    engine = Engine(model, graph, train_batches, val_batches, test_batches,
+                    RandomNegative(N), APEval(), config)
+
+    for epoch in range(1, 6):
+        assert engine._should_eval(epoch, 0.5) is True
+
+
+def test_auc_eval():
+    """AUCEval produces valid AUC-ROC score."""
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (80,), device=dev),
+        torch.randint(0, N, (80,), device=dev),
+        torch.linspace(0, 80, 80, dtype=torch.float64, device=dev),
+        torch.randn(80, d, device=dev),
+    )
+
+    eval_batches = [RawBatch(
+        src=torch.randint(0, N, (8,), device=dev),
+        dst=torch.randint(0, N, (8,), device=dev),
+        time=torch.full((8,), 90.0, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(8, d, device=dev),
+        neg=torch.randint(0, N, (8,), device=dev),
+    )]
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1).to(dev)
+    pipeline = DataPipeline(model.gather_spec, graph)
+
+    evaluator = AUCEval()
+    metrics = evaluator.evaluate(model, pipeline, eval_batches, graph)
+    assert "auc" in metrics
+    assert 0.0 <= metrics["auc"] <= 1.0
+
+
+def test_ap_eval_with_auc():
+    """APEval with include_auc=True produces both AP and AUC."""
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (80,), device=dev),
+        torch.randint(0, N, (80,), device=dev),
+        torch.linspace(0, 80, 80, dtype=torch.float64, device=dev),
+        torch.randn(80, d, device=dev),
+    )
+
+    eval_batches = [RawBatch(
+        src=torch.randint(0, N, (8,), device=dev),
+        dst=torch.randint(0, N, (8,), device=dev),
+        time=torch.full((8,), 90.0, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(8, d, device=dev),
+        neg=torch.randint(0, N, (8,), device=dev),
+    )]
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1).to(dev)
+    pipeline = DataPipeline(model.gather_spec, graph)
+
+    evaluator = APEval(include_auc=True)
+    metrics = evaluator.evaluate(model, pipeline, eval_batches, graph)
+    assert "ap" in metrics
+    assert "auc" in metrics
+    assert 0.0 <= metrics["auc"] <= 1.0
+
+
+def test_structured_result_output():
+    """Engine writes result.json when result_dir is set."""
+    import json
+    import os
+    import tempfile
+
+    N, K, d, dev = 30, 4, 8, "cuda"
+    graph = TemporalGraph(N, buffer_size=16, edge_feat_dim=d, device=dev)
+    graph.advance(
+        torch.randint(0, N, (50,), device=dev),
+        torch.randint(0, N, (50,), device=dev),
+        torch.linspace(0, 50, 50, dtype=torch.float64, device=dev),
+        torch.randn(50, d, device=dev),
+    )
+
+    train_batches = [RawBatch(
+        src=torch.randint(0, N, (4,), device=dev),
+        dst=torch.randint(0, N, (4,), device=dev),
+        time=torch.full((4,), 60.0 + i, dtype=torch.float64, device=dev),
+        edge_feat=torch.randn(4, d, device=dev),
+    ) for i in range(4)]
+    val_batches = test_batches = train_batches[2:4]
+
+    model = GraphMixer(d_model=16, d_edge=d, d_time=4, K=K, num_layers=1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = TrainConfig(
+            epochs=3, batch_size=4, lr=1e-3, patience=0, device=dev,
+            eval_strategy="all", result_dir=tmpdir,
+        )
+        engine = Engine(model, graph, train_batches, val_batches, test_batches,
+                        RandomNegative(N), APEval(), config)
+        engine.train()
+
+        result_path = os.path.join(tmpdir, "result.json")
+        assert os.path.exists(result_path)
+
+        with open(result_path) as f:
+            result = json.load(f)
+
+        assert "model" in result
+        assert "config" in result
+        assert "result" in result
+        assert "stats" in result
+        assert result["model"] == "GraphMixer"
+        assert result["result"]["best_val"] > 0
+        assert result["stats"]["eval_count"] > 0
+
+
+def test_trainconfig_defaults():
+    """TrainConfig has correct defaults for new fields."""
+    cfg = TrainConfig()
+    assert cfg.patience == 0
+    assert cfg.eval_strategy == "adaptive"
+    assert cfg.min_eval_gap == 1
+    assert cfg.max_eval_gap == 10
+    assert cfg.loss_threshold == 0.02
+    assert cfg.result_dir is None
