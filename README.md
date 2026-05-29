@@ -297,11 +297,13 @@ tgengine.nn
 
 ### Data Pipeline Breakdown
 
+> Kernel dispatch priority: **custom CUDA ext → Triton → vectorized PyTorch** (auto-selected at startup)
+
 | Operation | TGEngine | DyGLib | Speedup |
 |-----------|----------|--------|:-------:|
 | Neighbor sampling | GPU `torch.searchsorted` | CPU Python loop | **5–7×** |
 | Batch transfer | Zero-copy (all GPU) | numpy → torch → `.to(device)` | **3–5×** |
-| Fused kernel (Triton) | Single launch, all nodes | N/A | **3–28×** |
+| Fused temporal kernel | CUDA (JIT compiled) / Triton fallback | CPU Python loop | **3–28×** |
 | Async prefetch | ✓ background CUDA stream | ✗ | **hides latency** |
 
 ### Accuracy Alignment
@@ -499,7 +501,7 @@ tgengine/
 - [x] Adaptive eval scheduling
 - [x] 26-dataset unified loader (DyGLib / TGB / TGB-Seq)
 - [x] Structured JSON output + multi-seed `run_experiment`
-- [ ] Custom CUDA / Triton kernels for temporal sampling (V2)
+- [x] Custom CUDA / Triton kernels for temporal sampling — fused 1-hop/2-hop sampling + co-occurrence (3–28× speedup)
 - [ ] Full-history negative sampling (T-CSR storage)
 - [ ] Node classification task support
 - [ ] `tgengine.hub` — download pretrained checkpoints
