@@ -2,10 +2,36 @@
 name = "tgengine"
 version = "0.1.0"
 description = "High-performance framework for Continuous-Time Dynamic Graph learning"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "TGEngine Contributors"},
+]
+keywords = [
+    "temporal-graph",
+    "dynamic-graph",
+    "graph-neural-network",
+    "link-prediction",
+    "deep-learning",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
 dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
+    "scikit-learn>=1.0",
+    "pandas>=1.5",
     "pyyaml>=6.0",
     "tqdm>=4.60",
 ]
@@ -18,6 +44,21 @@ dev = [
 tgb = [
     "tgb>=0.9",
 ]
+wandb = [
+    "wandb>=0.15",
+]
+mamba = [
+    "mamba-ssm>=1.0",
+]
+all = [
+    "tgengine[dev,tgb,wandb]",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/tgengine"
+Documentation = "https://github.com/YOUR_USERNAME/tgengine/tree/main/docs"
+Repository = "https://github.com/YOUR_USERNAME/tgengine"
+Issues = "https://github.com/YOUR_USERNAME/tgengine/issues"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -25,3 +66,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["tgengine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"

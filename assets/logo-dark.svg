@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#64748b" stroke-width="1"/>
+    </marker>
+  </defs>
+  <!-- Graph icon -->
+  <g transform="translate(12, 8)">
+    <!-- Edges -->
+    <line x1="30" y1="50" x2="60" y2="22" stroke="#a5b4fc" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="30" y1="50" x2="65" y2="72" stroke="#93bbfc" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="60" y1="22" x2="92" y2="38" stroke="#7dd3fc" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="65" y1="72" x2="92" y2="38" stroke="#67e8f9" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="92" y1="38" x2="78" y2="82" stroke="#a5b4fc" stroke-width="2" stroke-dasharray="4,3" opacity="0.5"/>
+    <!-- Time arrow -->
+    <line x1="15" y1="96" x2="98" y2="96" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <text x="50" y="108" font-family="monospace" font-size="9" fill="#64748b" text-anchor="middle">t</text>
+    <!-- Nodes -->
+    <circle cx="30" cy="50" r="7" fill="#818cf8"/>
+    <circle cx="60" cy="22" r="6" fill="#93a0f8"/>
+    <circle cx="65" cy="72" r="6" fill="#93a0f8"/>
+    <circle cx="92" cy="38" r="7" fill="#a5b4fc"/>
+    <circle cx="78" cy="82" r="4.5" fill="#c4b5fd" opacity="0.6"/>
+  </g>
+  <!-- Title -->
+  <text x="132" y="62" font-family="sans-serif" font-size="46" font-weight="700" fill="#f1f5f9">TG</text>
+  <text x="208" y="62" font-family="sans-serif" font-size="46" font-weight="700" fill="#818cf8">Engine</text>
+  <!-- Tagline -->
+  <text x="134" y="88" font-family="sans-serif" font-size="14" fill="#94a3b8">High-Performance Temporal Graph Learning</text>
+</svg>
