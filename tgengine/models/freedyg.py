@@ -24,7 +24,7 @@ from torch import Tensor
 
 from tgengine.core.batch import NeighborData, PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-from tgengine.models.base import ModelOutput, TemporalModel
+from tgengine.models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from tgengine.nn import FixedCosineTimeEncoder, MergeDecoder
 from tgengine.nn.mlp_mixer import FreeDyGMixerLayer
 
@@ -158,6 +158,15 @@ class FreeDyG(TemporalModel):
 
         self.out_proj = nn.Linear(d_edge, d_model)
         self.decoder = MergeDecoder(d_model)
+
+    def encode(self, batch: PreparedBatch) -> EmbeddingBundle:
+        src, dst = self._encode_pair(
+            batch.src_neighbors, batch.dst_neighbors, batch.time
+        )
+        src_for_neg, neg = self._encode_pair(
+            batch.src_neighbors, batch.neg_neighbors, batch.time
+        )
+        return EmbeddingBundle(src=src, dst=dst, neg=neg, src_for_neg=src_for_neg)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
         # Positive pass: (src, dst) pair

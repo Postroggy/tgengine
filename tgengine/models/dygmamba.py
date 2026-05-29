@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-from tgengine.models.base import ModelOutput, TemporalModel
+from tgengine.models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from tgengine.nn import BilinearDecoder, MambaSeqEncoder, Time2Vec
 
 
@@ -29,6 +29,12 @@ class DyGMamba(TemporalModel):
         self.feat_proj = nn.Linear(d_edge + d_model, d_model)
         self.encoder = MambaSeqEncoder(d_model, n_layers)
         self.decoder = BilinearDecoder(d_model)
+
+    def encode(self, batch: PreparedBatch) -> EmbeddingBundle:
+        src = self._encode_neighbors(batch.src_neighbors, batch.time)
+        dst = self._encode_neighbors(batch.dst_neighbors, batch.time)
+        neg = self._encode_neighbors(batch.neg_neighbors, batch.time)
+        return EmbeddingBundle(src=src, dst=dst, neg=neg)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
         src_emb = self._encode_neighbors(batch.src_neighbors, batch.time)

@@ -130,6 +130,9 @@ class DataPipeline:
             neg_src_neighbors=neg_src_nbrs,
             neg_src=raw_batch.neg_src,
             co_occurrence=co_occur,
+            node_labels=raw_batch.node_labels,
+            edge_labels=raw_batch.edge_labels,
+            node_feat=raw_batch.node_feat,
         )
 
     def prepare_with_hist_neg(self, raw_batch: RawBatch, num_nodes: int) -> PreparedBatch:
@@ -195,6 +198,9 @@ class DataPipeline:
             dst_neighbors=dst_nbrs,
             neg_neighbors=neg_nbrs,
             co_occurrence=co_occur,
+            node_labels=raw_batch.node_labels,
+            edge_labels=raw_batch.edge_labels,
+            node_feat=raw_batch.node_feat,
         )
 
     @staticmethod

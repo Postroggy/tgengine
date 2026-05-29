@@ -22,7 +22,7 @@ from torch import Tensor
 
 from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-from tgengine.models.base import ModelOutput, TemporalModel
+from tgengine.models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from tgengine.core.batch import NeighborData
 from tgengine.nn import FixedCosineTimeEncoder, TransformerBlock
 
@@ -211,6 +211,19 @@ class DyGFormer(TemporalModel):
             nn.ReLU(),
             nn.Linear(d_model, 1),
         )
+
+    def encode(self, batch: PreparedBatch) -> EmbeddingBundle:
+        src, dst = self._encode_pair(
+            batch.src_neighbors, batch.dst_neighbors, batch.time,
+            batch.src, batch.dst,
+        )
+        neg_src_nbrs = batch.neg_src_neighbors if batch.neg_src_neighbors is not None else batch.src_neighbors
+        neg_src_ids = batch.neg_src if batch.neg_src is not None else batch.src
+        src_for_neg, neg = self._encode_pair(
+            neg_src_nbrs, batch.neg_neighbors, batch.time,
+            neg_src_ids, batch.neg,
+        )
+        return EmbeddingBundle(src=src, dst=dst, neg=neg, src_for_neg=src_for_neg)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
         # Positive: encode (src, dst) jointly

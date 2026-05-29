@@ -59,6 +59,12 @@ class TemporalDataset:
     val_neg_candidates: Optional[Tensor] = None   # (N_val, N_neg) node IDs
     test_neg_candidates: Optional[Tensor] = None  # (N_test, N_neg) node IDs
 
+    # Task labels (optional — for node/edge classification and regression tasks)
+    node_labels: Optional[Tensor] = None   # (num_nodes,) or (num_nodes, C) — static node labels
+    edge_labels: Optional[Tensor] = None   # (num_edges,) or (num_edges, C) — per-event labels
+    num_node_classes: Optional[int] = None  # C for node classification
+    num_edge_classes: Optional[int] = None  # C for edge classification
+
     @property
     def edge_feat_dim(self) -> int:
         return self.edge_feat.shape[1] if self.edge_feat is not None else 0
@@ -99,11 +105,32 @@ class TemporalDataset:
             j = min(i + batch_size, len(idx))
             batch_idx = idx[i:j]
             feat = self.edge_feat[batch_idx].to(device) if self.edge_feat is not None else None
+
+            # Node labels: look up by src node ID
+            nl = None
+            if self.node_labels is not None:
+                src_ids = self.src[batch_idx]
+                nl = self.node_labels[src_ids].to(device)
+
+            # Edge labels: aligned with edge index
+            el = None
+            if self.edge_labels is not None:
+                el = self.edge_labels[batch_idx].to(device)
+
+            # Node features: look up by src node ID
+            nf = None
+            if self.node_feat is not None:
+                src_ids = self.src[batch_idx]
+                nf = self.node_feat[src_ids].to(device)
+
             batches.append(RawBatch(
                 src=self.src[batch_idx].to(device),
                 dst=self.dst[batch_idx].to(device),
                 time=self.time[batch_idx].to(device),
                 edge_feat=feat,
+                node_labels=nl,
+                edge_labels=el,
+                node_feat=nf,
             ))
         return batches
 

@@ -35,7 +35,7 @@ from torch import Tensor
 
 from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-from tgengine.models.base import ModelOutput, TemporalModel
+from tgengine.models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from tgengine.nn import ConcatDecoder, FixedCosineTimeEncoder, MergeDecoder
 from tgengine.nn.mlp_mixer import MLPMixerLayer
 
@@ -104,6 +104,12 @@ class GraphMixer(TemporalModel):
 
         self.output_layer = nn.Linear(num_channels + d_node, d_model, bias=True)
         self.decoder = ConcatDecoder(d_model)
+
+    def encode(self, batch: PreparedBatch) -> EmbeddingBundle:
+        src = self._encode(batch.src, batch.src_neighbors, batch.time)
+        dst = self._encode(batch.dst, batch.dst_neighbors, batch.time)
+        neg = self._encode(batch.neg, batch.neg_neighbors, batch.time)
+        return EmbeddingBundle(src=src, dst=dst, neg=neg)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
         src_emb = self._encode(batch.src, batch.src_neighbors, batch.time)

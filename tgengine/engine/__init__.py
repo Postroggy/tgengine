@@ -4,7 +4,7 @@ import json
 import math
 import os
 import time as time_module
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -12,10 +12,11 @@ from tqdm import tqdm
 
 from tgengine.core.batch import RawBatch
 from tgengine.core.temporal_graph import TemporalGraph
-from tgengine.models.base import TemporalModel
+from tgengine.models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from tgengine.pipeline import DataPipeline
 from tgengine.pipeline.async_pipeline import AsyncDataPipeline
 from tgengine.pipeline.negatives import NegativeStrategy
+from tgengine.tasks.base import TaskHead
 from tgengine.utils.logging import TrainLogger, validate_config
 
 from .config import TrainConfig
@@ -54,13 +55,43 @@ __all__ = [
 
 
 class Engine:
-    """Main training and evaluation engine.
+    """Training and evaluation engine.
 
-    Manages the full lifecycle:
-    - Builds DataPipeline from model's GatherSpec
-    - Runs training loop with async prefetch
-    - Handles eval with graph snapshot/restore
-    - Manages stateful model lifecycle (evolve/freeze/thaw)
+    ## Simple usage (link prediction, backward-compatible):
+
+        engine = Engine(
+            model=GraphMixer(d_model=172, ...),
+            graph=graph,
+            train_batches=train, val_batches=val, test_batches=test,
+            neg_strategy=RandomNegative(num_nodes),
+            eval_protocol=APEval(),
+            config=TrainConfig(),
+        )
+        engine.train()
+
+    ## Multi-task usage:
+
+        engine = Engine(
+            model=GraphMixer(d_model=172, ...),
+            ...
+            tasks={
+                "link_pred": LinkPredHead(),
+                "node_cls": NodeClassificationHead(172, num_classes=7),
+            },
+            task_weights={"link_pred": 1.0, "node_cls": 0.5},
+            eval_protocols={
+                "link_pred": APEval(),
+                "node_cls": NodeClsEval(num_classes=7),
+            },
+            primary_metric="ap",        # which val metric drives early stopping
+        )
+
+    When `tasks` is provided the engine calls `model.encode()` to get
+    `EmbeddingBundle`, routes src/dst embeddings into each head, and sums the
+    weighted losses. `eval_protocol` (single) is still supported for backward
+    compatibility; `eval_protocols` (dict) is the new multi-task form.
+
+    Either `eval_protocol` or `eval_protocols` must be provided.
     """
 
     def __init__(
@@ -71,12 +102,33 @@ class Engine:
         val_batches: list[RawBatch],
         test_batches: list[RawBatch],
         neg_strategy: NegativeStrategy,
-        eval_protocol: EvalProtocol,
-        config: TrainConfig,
+        # eval_protocol before config to preserve positional backward-compat
+        eval_protocol: Optional[EvalProtocol] = None,
+        config: Optional[TrainConfig] = None,
+        # --- multi-task ---
+        tasks: Optional[Dict[str, TaskHead]] = None,
+        task_weights: Optional[Dict[str, float]] = None,
+        eval_protocols: Optional[Dict[str, EvalProtocol]] = None,
+        primary_metric: Optional[str] = None,
+        # --- misc ---
         inductive_edges: Optional[dict] = None,
         eval_neg_strategy: Optional[NegativeStrategy] = None,
     ):
+        if eval_protocol is None and eval_protocols is None:
+            raise ValueError("Provide either eval_protocol (single) or eval_protocols (dict).")
+
+        if config is None:
+            config = TrainConfig()
         validate_config(config)
+
+        # Normalize to dict form internally
+        if eval_protocols is not None:
+            self._eval_protocols: Dict[str, EvalProtocol] = eval_protocols
+        else:
+            self._eval_protocols = {"default": eval_protocol}  # type: ignore[dict-item]
+
+        # Keep single-protocol reference for backward compat
+        self.eval_protocol = eval_protocol or next(iter(self._eval_protocols.values()))
 
         self.model = model.to(config.device)
         self.graph = graph
@@ -85,9 +137,17 @@ class Engine:
         self.test_batches = test_batches
         self.neg_strategy = neg_strategy
         self.eval_neg_strategy = eval_neg_strategy or neg_strategy
-        self.eval_protocol = eval_protocol
         self.config = config
         self.inductive_edges = inductive_edges
+
+        # Task heads (optional multi-task)
+        self._tasks: Dict[str, TaskHead] = {}
+        if tasks:
+            self._tasks = {k: v.to(config.device) for k, v in tasks.items()}
+        self._task_weights: Dict[str, float] = task_weights or {}
+        self._primary_metric = primary_metric or self._infer_primary_metric()
+        self._use_tasks = bool(self._tasks)
+
         self.logger = TrainLogger(
             model_name=model.__class__.__name__,
             dataset_name="",
@@ -104,9 +164,7 @@ class Engine:
             graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
         graph.freeze_csr()
 
-        # Build eval graph once: full CSR with ALL edges (train+val+test+inductive).
-        # DyGLib uses full_neighbor_sampler during eval — overflow ring buffer can't
-        # hold enough edges for popular nodes, so we freeze everything into CSR.
+        # Build full eval graph (all splits) to match DyGLib eval protocol
         self._eval_graph = TemporalGraph(
             graph.num_nodes, edge_feat_dim=graph.edge_feat_dim,
             device=config.device,
@@ -124,7 +182,11 @@ class Engine:
         self._eval_graph.freeze_csr()
         self._eval_pipeline = DataPipeline(model.gather_spec, self._eval_graph)
 
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        # Optimizer covers model + all task heads
+        all_params = list(model.parameters())
+        for head in self._tasks.values():
+            all_params.extend(head.parameters())
+        self.optimizer = torch.optim.Adam(all_params, lr=config.lr)
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
         self.scheduler = self._build_scheduler() if config.warmup_steps > 0 else None
         if config.compile_model:
@@ -151,11 +213,21 @@ class Engine:
                         "grad_clip": config.grad_clip,
                         "warmup_steps": config.warmup_steps,
                         "model_params": sum(p.numel() for p in model.parameters()),
+                        "tasks": list(self._tasks.keys()),
                     },
                 )
                 self._wandb = wandb
             except ImportError:
                 print("Warning: wandb not installed, skipping logging")
+
+    def _infer_primary_metric(self) -> str:
+        """Pick a sensible default primary metric from the eval protocols."""
+        for preferred in ("ap", "mrr", "auc", "acc", "f1_macro", "auroc"):
+            for proto in self._eval_protocols.values():
+                if hasattr(proto, "_primary_hint") and proto._primary_hint == preferred:
+                    return preferred
+        # Fall back to first metric key of first protocol (resolved at eval time)
+        return "ap"
 
     def _build_scheduler(self):
         total_steps = self.config.epochs * len(self.train_batches)
@@ -169,6 +241,80 @@ class Engine:
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
+    # ------------------------------------------------------------------
+    # Core: step a single prepared batch through model + task heads
+    # ------------------------------------------------------------------
+
+    def _step(self, prepared) -> ModelOutput:
+        """Run one forward pass: either multi-task (encode→heads) or legacy forward()."""
+        if self._use_tasks:
+            return self._step_multitask(prepared)
+        return self.model(prepared)
+
+    def _step_multitask(self, prepared) -> ModelOutput:
+        """Multi-task step: encode() → route embeddings to each head → sum losses."""
+        bundle: EmbeddingBundle = self.model.encode(prepared)
+
+        total_loss = torch.tensor(0.0, device=bundle.src.device)
+        merged = ModelOutput(
+            loss=total_loss,
+            pos_score=torch.zeros(bundle.src.shape[0], device=bundle.src.device),
+            neg_score=torch.zeros(bundle.src.shape[0], device=bundle.src.device),
+        )
+
+        for name, head in self._tasks.items():
+            w = self._task_weights.get(name, 1.0)
+            out = self._route_to_head(head, name, bundle, prepared)
+            total_loss = total_loss + w * out.loss
+
+            # Merge non-None fields (last write wins)
+            if out.pos_score is not None and out.pos_score.any():
+                merged.pos_score = out.pos_score
+                merged.neg_score = out.neg_score
+            if out.node_pred is not None:
+                merged.node_pred = out.node_pred
+                merged.node_labels = out.node_labels
+            if out.edge_pred is not None:
+                merged.edge_pred = out.edge_pred
+                merged.edge_labels = out.edge_labels
+            if out.anomaly_score is not None:
+                merged.anomaly_score = out.anomaly_score
+
+        merged.loss = total_loss
+        return merged
+
+    def _route_to_head(self, head: TaskHead, name: str, bundle: EmbeddingBundle, prepared) -> ModelOutput:
+        """Route embeddings to a task head, passing the right kwargs per head type."""
+        from tgengine.tasks.link_pred import LinkPredHead
+        from tgengine.tasks.node_cls import NodeClassificationHead, NodeBinaryClassificationHead
+        from tgengine.tasks.node_reg import NodeRegressionHead
+        from tgengine.tasks.edge_cls import EdgeClassificationHead, EdgeBinaryClassificationHead
+        from tgengine.tasks.edge_reg import EdgeRegressionHead
+        from tgengine.tasks.anomaly import AnomalyDetectionHead
+
+        src = bundle.src
+        src_for_neg = bundle.src_for_neg if bundle.src_for_neg is not None else bundle.src
+
+        if isinstance(head, LinkPredHead):
+            return head(src, src_emb=src, dst_emb=bundle.dst, neg_emb=bundle.neg)
+
+        if isinstance(head, (EdgeClassificationHead, EdgeBinaryClassificationHead, EdgeRegressionHead)):
+            return head(src, labels=prepared.edge_labels, dst_emb=bundle.dst)
+
+        if isinstance(head, (NodeClassificationHead, NodeBinaryClassificationHead, NodeRegressionHead)):
+            return head(src, labels=prepared.node_labels)
+
+        if isinstance(head, AnomalyDetectionHead):
+            labels = prepared.node_labels if prepared.node_labels is not None else prepared.edge_labels
+            return head(src, labels=labels)
+
+        # Generic fallback: pass src emb + node_labels
+        return head(src, labels=prepared.node_labels)
+
+    # ------------------------------------------------------------------
+    # Checkpoint
+    # ------------------------------------------------------------------
+
     def save_checkpoint(self, path: str) -> None:
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
@@ -178,6 +324,8 @@ class Engine:
             "best_val": self._best_val,
             "config": self.config,
         }
+        if self._tasks:
+            checkpoint["task_heads"] = {k: v.state_dict() for k, v in self._tasks.items()}
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(checkpoint, path)
 
@@ -187,20 +335,25 @@ class Engine:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        if "task_heads" in checkpoint:
+            for k, sd in checkpoint["task_heads"].items():
+                if k in self._tasks:
+                    self._tasks[k].load_state_dict(sd)
         self._current_epoch = checkpoint["epoch"]
         self._best_val = checkpoint["best_val"]
         return self._current_epoch
 
-    def _should_eval(self, epoch: int, train_loss: float) -> bool:
-        """Decide whether to run validation this epoch."""
-        strategy = self.config.eval_strategy
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
 
+    def _should_eval(self, epoch: int, train_loss: float) -> bool:
+        strategy = self.config.eval_strategy
         if strategy == "all":
             return True
         if strategy == "every_n":
             return epoch % self.config.eval_every == 0 or epoch == self.config.epochs
-
-        # adaptive strategy
+        # adaptive
         if epoch == 1 or epoch == self.config.epochs:
             return True
         gap = epoch - self._last_eval_epoch
@@ -233,14 +386,16 @@ class Engine:
                     f"(current: {self.config.batch_size}) or neighbor K."
                 )
 
-            # Evaluate
             if self._should_eval(epoch, train_loss):
                 self._last_eval_epoch = epoch
                 self._loss_at_last_eval = train_loss
                 eval_count += 1
 
                 val_metrics = self._evaluate(self.val_batches)
-                val_score = val_metrics.get("ap", val_metrics.get("mrr", 0.0))
+                val_score = val_metrics.get(self._primary_metric, 0.0)
+                # Fall back to first available metric
+                if val_score == 0.0 and val_metrics:
+                    val_score = next(iter(val_metrics.values()))
 
                 is_best = val_score > best_val
                 if is_best:
@@ -279,7 +434,6 @@ class Engine:
         elapsed = time_module.time() - t_start
         self.logger.log_finish(best_test, self._current_epoch)
 
-        # Structured result output
         result = {
             "model": self.model.__class__.__name__,
             "config": {
@@ -316,6 +470,8 @@ class Engine:
 
     def _train_epoch(self) -> float:
         self.model.train()
+        for head in self._tasks.values():
+            head.train()
         total_loss = 0.0
 
         if self.async_pipeline is not None:
@@ -337,11 +493,14 @@ class Engine:
             prepared = self.pipeline.prepare(raw_batch)
             self.optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                output = self.model(prepared)
+                output = self._step(prepared)
             self.scaler.scale(output.loss).backward()
             if self.config.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                nn.utils.clip_grad_norm_(
+                    list(self.model.parameters()) + [p for h in self._tasks.values() for p in h.parameters()],
+                    self.config.grad_clip,
+                )
             self.scaler.step(self.optimizer)
             self.scaler.update()
             if self.scheduler is not None:
@@ -366,17 +525,19 @@ class Engine:
 
             self.optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                output = self.model(prepared)
+                output = self._step(prepared)
             self.scaler.scale(output.loss).backward()
             if self.config.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                nn.utils.clip_grad_norm_(
+                    list(self.model.parameters()) + [p for h in self._tasks.values() for p in h.parameters()],
+                    self.config.grad_clip,
+                )
             self.scaler.step(self.optimizer)
             self.scaler.update()
             if self.scheduler is not None:
                 self.scheduler.step()
             total_loss += output.loss.item()
-
             self.model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
 
             if i + 1 < len(batches):
@@ -385,8 +546,10 @@ class Engine:
         return total_loss
 
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
-        """Run evaluation using pre-built full-data eval graph."""
+        """Run all registered eval protocols; return merged metrics dict."""
         model_state = self.model.freeze()
+        for head in self._tasks.values():
+            head.eval()
 
         prepped = []
         for rb in eval_batches:
@@ -398,13 +561,18 @@ class Engine:
                               edge_indices=rb.edge_indices)
             prepped.append(rb)
 
+        all_metrics: dict[str, float] = {}
         with torch.amp.autocast("cuda", enabled=self.config.use_amp):
-            metrics = self.eval_protocol.evaluate(
-                self.model, self._eval_pipeline, prepped, self._eval_graph
-            )
+            for proto in self._eval_protocols.values():
+                metrics = proto.evaluate(
+                    self.model, self._eval_pipeline, prepped, self._eval_graph
+                )
+                all_metrics.update(metrics)
 
         self.model.thaw(model_state)
-        return metrics
+        for head in self._tasks.values():
+            head.train()
+        return all_metrics
 
 
 def run_experiment(
@@ -416,8 +584,7 @@ def run_experiment(
     """Run multiple training runs with different seeds and aggregate results.
 
     Args:
-        build_fn: callable(seed: int) -> Engine. Must construct a fresh model,
-            graph, dataset, and Engine each call.
+        build_fn: callable(seed: int) -> Engine.
         seeds: explicit seed list. If None, uses [0, 1, ..., n_runs-1].
         n_runs: number of runs (ignored if seeds is provided).
         result_dir: directory to write per-run and aggregated results.
@@ -441,11 +608,9 @@ def run_experiment(
         all_results.append(test_metrics)
         per_run.append({"seed": seed, "test_metrics": test_metrics})
 
-        # Clean up GPU memory between runs
         del engine
         torch.cuda.empty_cache()
 
-    # Aggregate
     metric_keys = list(all_results[0].keys()) if all_results else []
     aggregated = {}
     for k in metric_keys:
@@ -470,3 +635,4 @@ def run_experiment(
         print(f"\nResults saved to {path}")
 
     return output
+

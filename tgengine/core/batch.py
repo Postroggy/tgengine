@@ -50,6 +50,11 @@ class RawBatch:
     neg_src: Optional[Tensor] = None  # (B,) negative src node IDs (for random-edge neg)
     edge_indices: Optional[Tensor] = None  # (B,) global edge indices (for TGB neg lookup)
 
+    # task labels
+    node_labels: Optional[Tensor] = None   # (B,) or (B, C) — node-level labels for src nodes
+    edge_labels: Optional[Tensor] = None   # (B,) or (B, C) — per-event labels
+    node_feat: Optional[Tensor] = None     # (B, d_node) — raw node features for src nodes
+
     @property
     def batch_size(self) -> int:
         return self.src.shape[0]
@@ -80,6 +85,11 @@ class PreparedBatch:
     neg_src: Optional[Tensor] = None  # (B,) negative src node IDs (random-edge neg)
     co_occurrence: Optional[Tensor] = None  # (B, K) co-neighbor counts or None
     memory_emb: Optional[Tensor] = None  # (B, d_mem) for TGN-style models
+
+    # task labels (passed through from RawBatch, untouched by pipeline)
+    node_labels: Optional[Tensor] = None   # (B,) or (B, C)
+    edge_labels: Optional[Tensor] = None   # (B,) or (B, C)
+    node_feat: Optional[Tensor] = None     # (B, d_node) raw node features for src
 
     @property
     def batch_size(self) -> int:

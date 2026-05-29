@@ -37,7 +37,7 @@ from .tasks import (
     TaskHead,
 )
 from .pipeline.async_pipeline import AsyncDataPipeline
-from .models.base import ModelOutput, TemporalModel
+from .models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from .models.dygformer import DyGFormer
 from .models.dygmamba import DyGMamba
 from .models.freedyg import FreeDyG
@@ -69,6 +69,7 @@ __all__ = [
     # models
     "DyGFormer",
     "DyGMamba",
+    "EmbeddingBundle",
     "FreeDyG",
     "GraphMixer",
     "ModelOutput",

@@ -21,7 +21,7 @@ from torch import Tensor
 
 from tgengine.core.batch import PreparedBatch
 from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-from tgengine.models.base import ModelOutput, TemporalModel
+from tgengine.models.base import EmbeddingBundle, ModelOutput, TemporalModel
 from tgengine.core.batch import NeighborData
 from tgengine.nn import BilinearDecoder, GRUSeqEncoder, Time2Vec
 from tgengine.nn.memory import NodeMemory
@@ -56,6 +56,12 @@ class TGN(TemporalModel):
 
         # Message function: [src_mem | dst_mem | time_enc | edge_feat] → message
         self.msg_fn = nn.Linear(d_model * 2 + d_model + d_edge, d_model)
+
+    def encode(self, batch: PreparedBatch) -> EmbeddingBundle:
+        src = self._embed(batch.src, batch.src_neighbors, batch.time)
+        dst = self._embed(batch.dst, batch.dst_neighbors, batch.time)
+        neg = self._embed(batch.neg, batch.neg_neighbors, batch.time)
+        return EmbeddingBundle(src=src, dst=dst, neg=neg)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
         src_emb = self._embed(batch.src, batch.src_neighbors, batch.time)
