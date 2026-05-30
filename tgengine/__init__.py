@@ -41,6 +41,7 @@ from .tasks import (
 from .pipeline import DataPipeline
 from .pipeline.async_pipeline import AsyncDataPipeline
 from .models.base import EmbeddingBundle, ModelOutput, TemporalModel
+from .models.crossmamba import CrossMamba
 from .models.dygformer import DyGFormer
 from .models.dygmamba import DyGMamba
 from .models.freedyg import FreeDyG
@@ -71,6 +72,7 @@ __all__ = [
     "load_dataset",
     "MixedDataset",
     # models
+    "CrossMamba",
     "DyGFormer",
     "DyGMamba",
     "EmbeddingBundle",
