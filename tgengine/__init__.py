@@ -4,6 +4,7 @@ __version__ = "0.1.0"
 
 from .core.batch import NeighborData, PreparedBatch, RawBatch
 from .core.dataset import TemporalDataset, load_dataset
+from .core.mixed_dataset import MixedDataset
 from .utils.download import download_dataset, list_available_datasets, list_datasets_by_family, set_proxy
 from .utils import prepare_ranking_negs
 from .core.gather_spec import GatherSpec, NeighborSpec
@@ -68,6 +69,7 @@ __all__ = [
     "TemporalDataset",
     "TemporalGraph",
     "load_dataset",
+    "MixedDataset",
     # models
     "DyGFormer",
     "DyGMamba",
