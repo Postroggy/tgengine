@@ -115,19 +115,16 @@ nvidia-smi GPU 3: RTX 3090 (25.3 GB) ← 同学使用，禁止占用
 
 ⚠️ **注意：nvidia-smi 编号 ≠ CUDA device 编号（取决于 CUDA_DEVICE_ORDER）**
 
-**不设置 `CUDA_DEVICE_ORDER`（默认，当前服务器状态）：**
-- CUDA device 0 = nvidia-smi GPU 1 = RTX 4080 ← **唯一可用**
-- CUDA device 1/2/3 = nvidia-smi GPU 0/2/3 = RTX 3090 ← **禁止使用**
-
-**若设置了 `CUDA_DEVICE_ORDER=PCI_BUS_ID`（匹配 nvidia-smi）：**
+**不设置 `CUDA_DEVICE_ORDER`（默认，2026-05-30 实测当前服务器状态）：**
 - CUDA device 0 = nvidia-smi GPU 0 = RTX 3090 ← **禁止！**
-- CUDA device 1 = nvidia-smi GPU 1 = RTX 4080 ← 此时需改用 `CUDA_VISIBLE_DEVICES=1`
+- CUDA device 1 = nvidia-smi GPU 1 = RTX 4080 ← **唯一可用**
+- CUDA device 2/3 = nvidia-smi GPU 2/3 = RTX 3090 ← **禁止使用**
 
-**所有在 scnu 上运行的脚本，不得设置 `CUDA_DEVICE_ORDER`，且必须设置 `CUDA_VISIBLE_DEVICES=0`**：
+**所有在 scnu 上运行的脚本，不得设置 `CUDA_DEVICE_ORDER`，且必须设置 `CUDA_VISIBLE_DEVICES=1`**：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python benchmarks/xxx.py
-CUDA_VISIBLE_DEVICES=0 conda run -n PyGBase python -m pytest tests/ -v
+CUDA_VISIBLE_DEVICES=1 python benchmarks/xxx.py
+CUDA_VISIBLE_DEVICES=1 conda run -n PyGBase python -m pytest tests/ -v
 ```
 
 RTX 4080 显存 16.7 GB；Reddit ring buffer 在 K=32 时约 14.8 GB，需自动降到 K≤17。
@@ -167,7 +164,7 @@ rsync -av --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' --exclude='
     /Users/xg/Coding/PersonalFile/tgengine/ scnu:~/CodeBase/Graph/tgengine/
 
 # 在远程运行测试（conda 环境 PyGBase，PyTorch 2.10+cu128，有 GPU）
-ssh scnu 'bash -l -c "cd ~/CodeBase/Graph/tgengine && conda run -n PyGBase python -m pytest tests/ -v 2>&1"'
+ssh scnu 'bash -l -c "cd ~/CodeBase/Graph/tgengine && CUDA_VISIBLE_DEVICES=1 conda run -n PyGBase python -m pytest tests/ -v 2>&1"'
 ```
 
 - 远程项目路径：`~/CodeBase/Graph/tgengine/`
@@ -191,7 +188,7 @@ export PATH="/mnt/home/gyq/miniconda3/bin:$PATH"
 eval "$(/mnt/home/gyq/miniconda3/bin/conda shell.bash hook)"
 conda activate PyGBase
 cd ~/CodeBase/Graph/tgengine
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONUNBUFFERED=1
 python -u examples/train_dygformer.py --dataset uci --epochs 100 --patience 20
 EOF
