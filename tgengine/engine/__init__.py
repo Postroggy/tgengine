@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -419,6 +420,7 @@ class Engine:
         best_val = self._best_val if resume else 0.0
         best_test: dict[str, float] = {}
         best_epoch = 0
+        best_model_state = None
         patience_counter = 0
         eval_count = 0
         # For "all_improve" rule: track per-metric best values
@@ -471,6 +473,7 @@ class Engine:
                     self._best_val = best_val
                     best_test = self._evaluate(self.test_batches)
                     best_epoch = epoch
+                    best_model_state = copy.deepcopy(self.model.state_dict())
                     patience_counter = 0
 
                     if self.config.checkpoint_dir is not None:
@@ -500,6 +503,10 @@ class Engine:
                 break
 
         elapsed = time_module.time() - t_start
+
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+
         self.logger.log_finish(best_test, self._current_epoch)
 
         result = {

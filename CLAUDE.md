@@ -211,6 +211,18 @@ ssh scnu 'tail -20 /tmp/tgengine_train.log'
 - 用 `tee` 同时输出到 terminal 和日志文件
 - 查看进度用 `tail`，不要持有长连接
 
+## 实验记录
+
+`experiments/` 目录下按实验方向分子文件夹，每个方向有 `log.md` 记录：
+- 实验 motivation 与设计
+- 每次运行的关键结果（AP、速度、配置）
+- 结论与下一步 idea
+
+当前活跃实验：
+- `experiments/crossmamba/log.md` — 跨域零样本链接预测，CrossMamba 模型
+
+**每次跑出新结果，必须将结果追加到对应 log.md，并更新「待做/Ideas」列表。**
+
 ## 进度跟踪
 
 每次对话有实质性进展时（修复 bug、完成功能、跑出实验结果），必须更新 memory 中的 progress 文件（`project_accuracy_alignment.md` 等），简短记录：做了什么、结果如何、下一步方向。防止开新对话时丢失上下文。

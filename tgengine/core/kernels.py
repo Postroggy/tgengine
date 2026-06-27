@@ -8,23 +8,29 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-# --- Try loading CUDA extension (JIT compiled) ---
+# --- Lazy CUDA extension loading (deferred until first use) ---
+# Loading at import time conflicts with mamba_ssm's CUDA kernel (global CUDA context clash).
 HAS_CUDA_EXT = False
 _cuda_ext = None
+_cuda_ext_loaded = False
 
-try:
-    from torch.utils.cpp_extension import load as _load_ext
-
-    _csrc_dir = Path(__file__).parent / "csrc"
-    if (_csrc_dir / "temporal_sample.cu").exists() and torch.cuda.is_available():
-        _cuda_ext = _load_ext(
-            name="tgengine_cuda",
-            sources=[str(_csrc_dir / "temporal_sample.cu")],
-            verbose=False,
-        )
-        HAS_CUDA_EXT = True
-except Exception:
-    pass
+def _ensure_cuda_ext():
+    global _cuda_ext, HAS_CUDA_EXT, _cuda_ext_loaded
+    if _cuda_ext_loaded:
+        return
+    _cuda_ext_loaded = True
+    try:
+        from torch.utils.cpp_extension import load as _load_ext
+        _csrc_dir = Path(__file__).parent / "csrc"
+        if (_csrc_dir / "temporal_sample.cu").exists() and torch.cuda.is_available():
+            _cuda_ext = _load_ext(
+                name="tgengine_cuda",
+                sources=[str(_csrc_dir / "temporal_sample.cu")],
+                verbose=False,
+            )
+            HAS_CUDA_EXT = True
+    except Exception:
+        pass
 
 # --- Triton fallback ---
 HAS_TRITON = False
@@ -98,6 +104,7 @@ def cuda_temporal_recent_k(
     k: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Fused CUDA kernel: binary search + feature copy in one launch."""
+    _ensure_cuda_ext()
     query_nodes_i64 = query_nodes.to(torch.int64).contiguous()
     query_times_f64 = query_times.to(torch.float64).contiguous()
 
@@ -120,6 +127,7 @@ def cuda_temporal_recent_2hop(
     k2: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Fused CUDA 2-hop: hop1 + hop2 in two kernel launches (no Python overhead)."""
+    _ensure_cuda_ext()
     query_nodes_i64 = query_nodes.to(torch.int64).contiguous()
     query_times_f64 = query_times.to(torch.float64).contiguous()
 
@@ -143,6 +151,7 @@ def cuda_co_neighbor_count(
     k: int,
 ) -> Tensor:
     """CUDA co-neighbor counting using shared memory."""
+    _ensure_cuda_ext()
     src_i64 = src_nodes.to(torch.int64).contiguous()
     dst_i64 = dst_nodes.to(torch.int64).contiguous()
     times_f64 = query_times.to(torch.float64).contiguous()
@@ -167,6 +176,7 @@ def cuda_co_occurrence_freq(
         a_freq: (B, K, 2) — [self_count, cross_count] per position
         b_freq: (B, K, 2) — [cross_count, self_count] per position
     """
+    _ensure_cuda_ext()
     a_ids_i32 = a_ids.to(torch.int32).contiguous()
     b_ids_i32 = b_ids.to(torch.int32).contiguous()
     results = _cuda_ext.co_occurrence_freq(a_ids_i32, b_ids_i32)

@@ -13,7 +13,7 @@ class TrainConfig:
     # When set, encoder (model) uses `lr` and heads use `head_lr`.
     # When None, all parameters share `lr`.
     head_lr: Optional[float] = None
-    patience: int = 0
+    patience: int = 5
     device: str = "cuda"
     seed: int = 42
     async_pipeline: bool = False

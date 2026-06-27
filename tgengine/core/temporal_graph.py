@@ -7,10 +7,10 @@ import torch
 from torch import Tensor
 
 from .batch import NeighborData
+from . import kernels as _kernels
 from .kernels import (
-    HAS_CUDA_EXT, HAS_TRITON,
     cuda_temporal_recent_k, cuda_temporal_recent_2hop, cuda_co_neighbor_count,
-    triton_temporal_recent_k,
+    triton_temporal_recent_k, _ensure_cuda_ext,
 )
 
 
@@ -59,7 +59,8 @@ class TemporalGraph:
     ):
         if buffer_size is not None:
             overflow_size = buffer_size
-        self._use_triton = use_triton and (HAS_CUDA_EXT or HAS_TRITON)
+        _ensure_cuda_ext()
+        self._use_triton = use_triton and (_kernels.HAS_CUDA_EXT or _kernels.HAS_TRITON)
         self.num_nodes = num_nodes
         self.edge_feat_dim = edge_feat_dim
         self.device = torch.device(device)
@@ -194,7 +195,7 @@ class TemporalGraph:
             query_nodes = safe_nodes.masked_fill(is_padding, 0).to(torch.int64)
             query_times = times.to(torch.float64)
 
-            if HAS_CUDA_EXT:
+            if _kernels.HAS_CUDA_EXT:
                 out_ids, out_times, out_feats, out_mask = cuda_temporal_recent_k(
                     self._offsets, self._nbr_times, self._nbr_ids, self._nbr_feats,
                     query_nodes, query_times, k,
@@ -401,7 +402,7 @@ class TemporalGraph:
         N = nodes.shape[0]
 
         # CUDA fused 2-hop path
-        if (self._use_triton and HAS_CUDA_EXT and self._ov_ids is None
+        if (self._use_triton and _kernels.HAS_CUDA_EXT and self._ov_ids is None
                 and N > 0 and self.device.type == "cuda"):
             safe_nodes = nodes.clamp(min=0)
             is_padding = nodes < 0
@@ -477,7 +478,7 @@ class TemporalGraph:
             self.freeze_csr()
 
         # CUDA fast path
-        if (self._use_triton and HAS_CUDA_EXT and self._ov_ids is None
+        if (self._use_triton and _kernels.HAS_CUDA_EXT and self._ov_ids is None
                 and src.shape[0] > 0 and self.device.type == "cuda"):
             return cuda_co_neighbor_count(
                 self._offsets, self._nbr_times, self._nbr_ids,
