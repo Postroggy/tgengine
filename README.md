@@ -51,7 +51,8 @@ TGEngine refuses the tradeoff:
 | Add new model | Modify 500-line train script | Encoder + hook + example | **~60 lines, 1 class** |
 | Data pipeline | CPU Python loop | GPU hook pipeline | **GPU-fused, single kernel** |
 | Async prefetch | ✗ | ✗ | **✓** |
-| Eval protocols | AP | TGB MRR | **AP · AUC · MRR · Hits@K · 3-Way** |
+| Eval protocols | AP | TGB MRR | **AP · AUC · MRR · Hits@K · 3-Way · Node/Edge/Anomaly** |
+| Cross-domain | ✗ | ✗ | **✓ MixedDataset + CrossMamba zero-shot** |
 | Adaptive eval scheduling | ✗ | ✗ | **✓ (saves ~70% eval time)** |
 | End-to-end speedup | 1× | 5–8× | **8–15× (target)** |
 
@@ -67,7 +68,7 @@ pip install tgengine
 <summary>From source (development)</summary>
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/tgengine.git
+git clone https://github.com/Postroggy/tgengine.git
 cd tgengine
 pip install -e ".[dev]"
 ```
@@ -253,6 +254,7 @@ flowchart TD
 | **GraphMixer** | ICLR 2023 | ~180 | MLP-Mixer on link token sequences |
 | **TGN** | ICML 2020 | ~120 | GRU node memory · message passing |
 | **DyGMamba** | 2024 | ~60 | Mamba SSM for temporal neighbor sequences |
+| **CrossMamba** | 2025 | ~190 | Cross-domain zero-shot via Mamba + structural features |
 | **EdgeBank** | — | ~20 | Heuristic memorization baseline |
 
 ### Neural Components (`tgengine.nn`)
@@ -313,6 +315,28 @@ tgengine.nn
 | DyGFormer | Wikipedia | 0.9908 | 0.9903 | +0.05% |
 | DyGFormer | UCI | 0.9610 | 0.9613 | −0.03% |
 | GraphMixer | Wikipedia | 0.9644 | 0.9725 | −0.8% |
+
+### Cross-Domain Zero-Shot Transfer
+
+TGEngine supports cross-domain link prediction via `MixedDataset` and `CrossMamba`:
+
+- **MixedDataset**: merge multiple datasets with automatic node ID remapping and per-domain time normalization. Supports both balanced (round-robin, equal domain contribution) and unbalanced (global time-sorted) mixing strategies.
+- **CrossMamba**: Mamba SSM backbone with domain-agnostic structural features (recency rank, repeat frequency, co-occurrence) — enables zero-shot transfer to unseen domains without feature alignment.
+
+| Train Domains | Zero-Shot Target | AP |
+|---------------|:----------------:|:---:|
+| UCI + CollegeMsg + BitcoinAlpha + Wikipedia | Contacts | 0.9381 |
+| (4 domains, balanced mixing) | MOOC | 0.8752 |
+| | mathoverflow | 0.8468 |
+| | lastfm | 0.6375 |
+
+```python
+from tgengine.core.mixed_dataset import MixedDataset
+
+datasets = [load_dataset(n) for n in ["uci", "CollegeMsg", "BitcoinAlpha", "wikipedia"]]
+mixed = MixedDataset(datasets)
+train_batches = mixed.get_batches("train", batch_size=200, balance=True)
+```
 
 ---
 
@@ -505,7 +529,9 @@ tgengine/
 │   ├── temporal_graph.py   # GPU-resident CSR + ring buffer
 │   ├── gather_spec.py      # GatherSpec · NeighborSpec
 │   ├── batch.py            # RawBatch · PreparedBatch · NeighborData
-│   └── dataset.py          # 26-dataset unified loader
+│   ├── dataset.py          # 26-dataset unified loader
+│   ├── mixed_dataset.py    # Cross-domain dataset with balanced mixing
+│   └── kernels.py          # CUDA/Triton fused temporal kernels
 ├── pipeline/
 │   ├── __init__.py         # DataPipeline — fused GPU ops
 │   ├── negatives.py        # Random · Historical · Inductive
@@ -523,6 +549,7 @@ tgengine/
 │   ├── tgn.py
 │   ├── graphmixer.py
 │   ├── dygmamba.py
+│   ├── crossmamba.py       # Cross-domain zero-shot via Mamba SSM
 │   ├── freedyg.py
 │   └── edgebank.py
 ├── engine/
@@ -561,7 +588,7 @@ If TGEngine helps your research, please cite:
 @software{tgengine2025,
   title   = {TGEngine: High-Performance Continuous-Time Dynamic Graph Learning Framework},
   year    = {2025},
-  url     = {https://github.com/YOUR_USERNAME/tgengine}
+  url     = {https://github.com/Postroggy/tgengine}
 }
 ```
 
