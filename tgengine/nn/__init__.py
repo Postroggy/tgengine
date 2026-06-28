@@ -2,6 +2,7 @@ from .co_neighbor import CoNeighborEncoder
 from .decoder import BilinearDecoder, ConcatDecoder, ConcatMLPDecoder, MergeDecoder
 from .memory import NodeMemory
 from .mlp_mixer import FeedForwardNet, FilterLayer, FreeDyGMixerLayer, MLPMixerLayer
+from .rotary_time import RotaryTimeEncoder, apply_rotary
 from .seq_encoder import (
     GRUSeqEncoder,
     MambaSeqEncoder,
@@ -28,8 +29,10 @@ __all__ = [
     "MergeDecoder",
     "MLPMixerLayer",
     "NodeMemory",
+    "RotaryTimeEncoder",
     "SequenceEncoder",
     "Time2Vec",
     "TransformerBlock",
     "TransformerSeqEncoder",
+    "apply_rotary",
 ]
