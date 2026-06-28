@@ -622,6 +622,8 @@ class Engine:
                 self.scheduler.step()
             total_loss += total_step_loss.item()
             self._raw_model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+            if hasattr(self.neg_strategy, "update"):
+                self.neg_strategy.update(raw_batch.src, raw_batch.dst)
         return total_loss
 
     def _train_epoch_async(self) -> float:
@@ -629,6 +631,7 @@ class Engine:
         batches = self._sharded_batches()
         total_loss = 0.0
         amp_enabled = self.config.use_amp
+        neg_has_update = hasattr(self.neg_strategy, "update")
 
         if not batches:
             return 0.0
@@ -638,8 +641,23 @@ class Engine:
         iterator = range(len(batches))
         if self._rank == 0:
             iterator = tqdm(iterator, desc="Training (async)")
+        prev_rb = None
         for i in iterator:
             rb, prepared = pipe.get()
+
+            # Flush the previous batch's edges into the neg pool BEFORE issuing
+            # the next prefetch. Order matters for thread safety:
+            #   - Python layer: pipe.get() already joined the prefetch thread T_i,
+            #     and T_{i+1} hasn't started yet, so no concurrent pool access.
+            #   - GPU layer: start_prefetch() calls prefetch_stream.wait_stream(main),
+            #     so the update kernel launched here on the main stream is
+            #     guaranteed to complete before T_{i+1}'s sample kernel reads
+            #     the pool on the prefetch stream.
+            # Net effect vs sync: pool membership lags by one batch (batch i's
+            # edges become visible to sampling at batch i+2 instead of i+1).
+            if prev_rb is not None and neg_has_update:
+                self.neg_strategy.update(prev_rb.src, prev_rb.dst)
+            prev_rb = rb
 
             # Issue prefetch for next batch BEFORE compute, so it overlaps with
             # forward/backward of the current batch. Safe because the training graph
@@ -669,6 +687,9 @@ class Engine:
                 self.scheduler.step()
             total_loss += total_step_loss.item()
             self._raw_model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
+
+        if prev_rb is not None and neg_has_update:
+            self.neg_strategy.update(prev_rb.src, prev_rb.dst)
 
         return total_loss
 
