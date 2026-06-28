@@ -1,6 +1,12 @@
 """Tests for CrossMamba model."""
 
 import pytest
+
+# CrossMamba requires mamba_ssm (selective_scan_fn CUDA kernel). Skip the
+# whole module on environments where mamba_ssm cannot import (e.g. GLIBC
+# mismatch on the test server) instead of erroring during collection.
+pytest.importorskip("mamba_ssm")
+
 import torch
 
 from tgengine import CrossMamba
