@@ -590,3 +590,23 @@ def test_trainconfig_defaults():
     assert cfg.max_eval_gap == 10
     assert cfg.loss_threshold == 0.02
     assert cfg.result_dir is None
+
+
+def test_distributed_config_defaults():
+    """DDP config defaults: off by default (single-GPU backward compat)."""
+    cfg = TrainConfig()
+    assert cfg.distributed is False, "distributed must default False (single-GPU)"
+    assert cfg.dist_backend == "nccl"
+    assert cfg.find_unused_parameters is False
+
+
+def test_engine_distributed_disabled_in_single_gpu():
+    """Engine with distributed=True but no process group stays single-GPU
+    (graceful fallback instead of crash)."""
+    engine = _small_setup()
+    engine.config.distributed = True
+    # No process group initialized → _distributed should be False
+    assert engine._distributed is False
+    assert engine._rank == 0
+    assert engine._world_size == 1
+    assert engine._raw_model is engine.model

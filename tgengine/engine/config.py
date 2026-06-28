@@ -23,6 +23,14 @@ class TrainConfig:
     compile_model: bool = False
     warmup_steps: int = 0
 
+    # Distributed training (DDP). When True, Engine wraps the model with
+    # DistributedDataParallel and uses a DistributedSampler to shard batches
+    # across ranks. The process group must be initialized externally (e.g. via
+    # `torchrun`); Engine detects torch.distributed.is_initialized() and adapts.
+    distributed: bool = False
+    dist_backend: str = "nccl"
+    find_unused_parameters: bool = False
+
     # Eval scheduling
     eval_strategy: Literal["adaptive", "every_n", "all"] = "adaptive"
     eval_every: int = 1

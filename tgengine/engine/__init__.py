@@ -211,6 +211,23 @@ class Engine:
         self.scheduler = self._build_scheduler() if config.warmup_steps > 0 else None
         if config.compile_model:
             self.model = torch.compile(self.model)
+
+        # Distributed (DDP) setup. Opt-in via config.distributed; requires an
+        # externally initialized process group (e.g. via torchrun).
+        self._distributed = config.distributed and torch.distributed.is_available() \
+            and torch.distributed.is_initialized()
+        self._rank = torch.distributed.get_rank() if self._distributed else 0
+        self._world_size = torch.distributed.get_world_size() if self._distributed else 1
+        if self._distributed:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            self.model = DDP(
+                self.model,
+                device_ids=[config.device] if config.device.startswith("cuda") else None,
+                find_unused_parameters=config.find_unused_parameters,
+            )
+        # Expose model for evolve/encode calls (unwrap DDP when needed)
+        self._raw_model = self.model.module if self._distributed else self.model
+
         self._current_epoch = 0
         self._best_val = 0.0
         self._last_eval_epoch = 0
@@ -277,7 +294,7 @@ class Engine:
         Heads with independent batch sources are NOT run here; they are stepped
         separately in _train_epoch_sync via _step_independent_heads().
         """
-        bundle: EmbeddingBundle = self.model.encode(prepared)
+        bundle: EmbeddingBundle = self._raw_model.encode(prepared)
 
         total_loss = torch.tensor(0.0, device=bundle.src.device)
         merged = ModelOutput(
@@ -328,7 +345,7 @@ class Engine:
                                    edge_feat=rb.edge_feat, neg=neg,
                                    edge_indices=rb.edge_indices)
             prep = self.pipeline.prepare(rb_with_neg)
-            bundle = self.model.encode(prep)
+            bundle = self._raw_model.encode(prep)
             w = self._task_weights.get(name, 1.0)
             out = self._route_to_head(head, name, bundle, prep)
             total = total + w * out.loss
@@ -368,7 +385,7 @@ class Engine:
 
     def save_checkpoint(self, path: str) -> None:
         checkpoint = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self._raw_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scaler_state_dict": self.scaler.state_dict(),
             "epoch": self._current_epoch,
@@ -382,7 +399,7 @@ class Engine:
 
     def load_checkpoint(self, path: str) -> int:
         checkpoint = torch.load(path, map_location=self.config.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self._raw_model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
@@ -451,6 +468,12 @@ class Engine:
                 if val_score == 0.0 and val_metrics:
                     val_score = next(iter(val_metrics.values()))
 
+                # DDP: average val_score across ranks so all ranks agree on is_best
+                if self._distributed:
+                    val_score_t = torch.tensor(val_score, device=self.config.device)
+                    torch.distributed.all_reduce(val_score_t, op=torch.distributed.ReduceOp.AVG)
+                    val_score = val_score_t.item()
+
                 # Determine is_best based on stopping_rule
                 if self.config.stopping_rule == "all_improve":
                     if not _all_improve_bests:
@@ -473,10 +496,10 @@ class Engine:
                     self._best_val = best_val
                     best_test = self._evaluate(self.test_batches)
                     best_epoch = epoch
-                    best_model_state = copy.deepcopy(self.model.state_dict())
+                    best_model_state = copy.deepcopy(self._raw_model.state_dict())
                     patience_counter = 0
 
-                    if self.config.checkpoint_dir is not None:
+                    if self._rank == 0 and self.config.checkpoint_dir is not None:
                         save_path = os.path.join(self.config.checkpoint_dir, "best.pt")
                         self.save_checkpoint(save_path)
                 else:
@@ -505,7 +528,7 @@ class Engine:
         elapsed = time_module.time() - t_start
 
         if best_model_state is not None:
-            self.model.load_state_dict(best_model_state)
+            self._raw_model.load_state_dict(best_model_state)
 
         self.logger.log_finish(best_test, self._current_epoch)
 
@@ -533,7 +556,7 @@ class Engine:
             },
         }
 
-        if self.config.result_dir:
+        if self._rank == 0 and self.config.result_dir:
             os.makedirs(self.config.result_dir, exist_ok=True)
             path = os.path.join(self.config.result_dir, "result.json")
             with open(path, "w") as f:
@@ -541,6 +564,9 @@ class Engine:
 
         if self._wandb:
             self._wandb.finish()
+        # DDP: ensure all ranks finish before returning
+        if self._distributed:
+            torch.distributed.barrier()
         return best_test
 
     def _train_epoch(self) -> float:
@@ -554,12 +580,20 @@ class Engine:
         else:
             total_loss = self._train_epoch_sync()
 
-        return total_loss / len(self.train_batches)
+        return total_loss / len(self._sharded_batches())
+
+    def _sharded_batches(self) -> list[RawBatch]:
+        """Batches for this rank (DDP shard). Single-GPU returns all batches."""
+        if not self._distributed:
+            return self.train_batches
+        return self.train_batches[self._rank::self._world_size]
 
     def _train_epoch_sync(self) -> float:
         total_loss = 0.0
         amp_enabled = self.config.use_amp
-        for step_idx, raw_batch in enumerate(tqdm(self.train_batches, desc="Training")):
+        batches = self._sharded_batches()
+        iterator = tqdm(batches, desc="Training") if self._rank == 0 else batches
+        for step_idx, raw_batch in enumerate(iterator):
             neg = self.neg_strategy.sample(
                 raw_batch.src, raw_batch.dst, raw_batch.time, self.graph,
                 raw_batch.edge_indices,
@@ -587,12 +621,12 @@ class Engine:
             if self.scheduler is not None:
                 self.scheduler.step()
             total_loss += total_step_loss.item()
-            self.model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
+            self._raw_model.evolve(raw_batch.src, raw_batch.dst, raw_batch.time, raw_batch.edge_feat)
         return total_loss
 
     def _train_epoch_async(self) -> float:
         pipe = self.async_pipeline
-        batches = self.train_batches
+        batches = self._sharded_batches()
         total_loss = 0.0
         amp_enabled = self.config.use_amp
 
@@ -601,7 +635,10 @@ class Engine:
 
         pipe.start_prefetch(batches[0])
 
-        for i in tqdm(range(len(batches)), desc="Training (async)"):
+        iterator = range(len(batches))
+        if self._rank == 0:
+            iterator = tqdm(iterator, desc="Training (async)")
+        for i in iterator:
             rb, prepared = pipe.get()
 
             # Issue prefetch for next batch BEFORE compute, so it overlaps with
@@ -631,13 +668,13 @@ class Engine:
             if self.scheduler is not None:
                 self.scheduler.step()
             total_loss += total_step_loss.item()
-            self.model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
+            self._raw_model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
 
         return total_loss
 
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
         """Run all registered eval protocols; return merged metrics dict."""
-        model_state = self.model.freeze()
+        model_state = self._raw_model.freeze()
         for head in self._tasks.values():
             head.eval()
 
@@ -661,7 +698,7 @@ class Engine:
                 )
                 all_metrics.update(metrics)
 
-        self.model.thaw(model_state)
+        self._raw_model.thaw(model_state)
         for head in self._tasks.values():
             head.train()
         return all_metrics
@@ -721,7 +758,7 @@ class Engine:
                 # No torch.no_grad() here: encoder params are frozen (requires_grad=False)
                 # but the computation graph still needs to flow through head params.
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    bundle = self.model.encode(prepared)
+                    bundle = self._raw_model.encode(prepared)
                     out = self._route_to_head(head, task_name, bundle, prepared)
                 if has_params and out.loss.requires_grad:
                     out.loss.backward()

@@ -149,6 +149,7 @@ def _make_engine_with_tasks(tasks, task_weights=None):
     engine._task_batches = {k: None for k in tasks}  # all tasks share batches
     engine._task_weights = task_weights or {}
     engine.model = _TinyModel(d=8)
+    engine._raw_model = engine.model  # DDP-aware code uses _raw_model for encode()
     engine._use_tasks = True
     return engine
 
