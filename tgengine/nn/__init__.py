@@ -1,5 +1,6 @@
 from .co_neighbor import CoNeighborEncoder
 from .decoder import BilinearDecoder, ConcatDecoder, ConcatMLPDecoder, MergeDecoder
+from .graph_cross_attention import GraphCrossAttention
 from .mamba_block import MambaBlock, TimeAwareMambaBlock
 from .memory import NodeMemory
 from .mlp_mixer import FeedForwardNet, FilterLayer, FreeDyGMixerLayer, MLPMixerLayer
@@ -24,6 +25,7 @@ __all__ = [
     "FilterLayer",
     "FreeDyGMixerLayer",
     "GRUSeqEncoder",
+    "GraphCrossAttention",
     "HarmonicEncoder",
     "MambaBlock",
     "MambaSeqEncoder",
