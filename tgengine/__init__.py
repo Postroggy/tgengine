@@ -41,12 +41,18 @@ from .tasks import (
 from .pipeline import DataPipeline
 from .pipeline.async_pipeline import AsyncDataPipeline
 from .models.base import EmbeddingBundle, ModelOutput, TemporalModel
-from .models.crossmamba import CrossMamba
 from .models.dygformer import DyGFormer
-from .models.dygmamba import DyGMamba
 from .models.freedyg import FreeDyG
 from .models.graphmixer import GraphMixer
 from .models.tgn import TGN
+
+# Mamba-backed models imported lazily (require mamba_ssm CUDA build).
+try:
+    from .models.crossmamba import CrossMamba
+    from .models.dygmamba import DyGMamba
+    _HAS_MAMBA_MODELS = True
+except ImportError:
+    _HAS_MAMBA_MODELS = False
 from .pipeline.negatives import (
     DyGLibHistoricalNegative,
     DyGLibInductiveNegative,
@@ -72,9 +78,7 @@ __all__ = [
     "load_dataset",
     "MixedDataset",
     # models
-    "CrossMamba",
     "DyGFormer",
-    "DyGMamba",
     "EmbeddingBundle",
     "FreeDyG",
     "GraphMixer",
@@ -128,3 +132,6 @@ __all__ = [
     "prepare_ranking_negs",
     "set_proxy",
 ]
+
+if _HAS_MAMBA_MODELS:
+    __all__ += ["CrossMamba", "DyGMamba"]

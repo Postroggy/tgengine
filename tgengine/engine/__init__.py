@@ -604,6 +604,13 @@ class Engine:
         for i in tqdm(range(len(batches)), desc="Training (async)"):
             rb, prepared = pipe.get()
 
+            # Issue prefetch for next batch BEFORE compute, so it overlaps with
+            # forward/backward of the current batch. Safe because the training graph
+            # is static (frozen CSR; train loop calls model.evolve, not graph.advance),
+            # so prefetch(i+1) has no dependency on compute(i).
+            if i + 1 < len(batches):
+                pipe.start_prefetch(batches[i + 1])
+
             self.optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 output = self._step(prepared)
@@ -625,9 +632,6 @@ class Engine:
                 self.scheduler.step()
             total_loss += total_step_loss.item()
             self.model.evolve(rb.src, rb.dst, rb.time, rb.edge_feat)
-
-            if i + 1 < len(batches):
-                pipe.start_prefetch(batches[i + 1])
 
         return total_loss
 

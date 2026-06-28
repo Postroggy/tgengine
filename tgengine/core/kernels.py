@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -18,17 +19,54 @@ def _ensure_cuda_ext():
     global _cuda_ext, HAS_CUDA_EXT, _cuda_ext_loaded
     if _cuda_ext_loaded:
         return
-    _cuda_ext_loaded = True
+    # _cuda_ext_loaded set True only after successful load (allow retry on transient failure)
+    # Preload libcudart from torch lib dir so the extension .so can find it
+    # without LD_LIBRARY_PATH (os.environ LD_LIBRARY_PATH does not affect dlopen post-start)
+    import ctypes
     try:
-        from torch.utils.cpp_extension import load as _load_ext
+        _sp = os.path.dirname(torch.__file__)
+        _cands = [
+            os.path.join(_sp, "lib", "libcudart.so.12"),
+            os.path.join(_sp, "..", "nvidia", "cuda_runtime", "lib", "libcudart.so.12"),
+            os.path.expanduser("~/cuda128/lib64/libcudart.so.12"),
+        ]
+        for _p in _cands:
+            if os.path.exists(_p):
+                ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+                break
+    except Exception:
+        pass
+    # CUDA_HOME detection: prefer 12.8 (cuda128 symlink) over system /usr/local/cuda (11.7)
+    import os
+    _cuda128 = os.path.expanduser("~/cuda128")
+    if os.path.isdir(_cuda128) and os.path.isdir(os.path.join(_cuda128, "lib64")):
+        os.environ["CUDA_HOME"] = _cuda128
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + os.path.join(_cuda128, "bin")
+    try:
         _csrc_dir = Path(__file__).parent / "csrc"
         if (_csrc_dir / "temporal_sample.cu").exists() and torch.cuda.is_available():
-            _cuda_ext = _load_ext(
-                name="tgengine_cuda",
-                sources=[str(_csrc_dir / "temporal_sample.cu")],
-                verbose=False,
+            # Load the extension .so. Prefer the cached build via cpp_extension's
+            # internal loader (skips ninja — system ninja needs GLIBC_2.35+ and
+            # breaks under the glibc 2.39 process switch used for mamba_ssm).
+            import os as _os
+            _cache_dir = _os.path.expanduser(
+                "~/.cache/torch_extensions/py311_cu128/tgengine_cuda"
             )
+            _so = _os.path.join(_cache_dir, "tgengine_cuda.so")
+            if _os.path.exists(_so):
+                from torch.utils.cpp_extension import _import_module_from_library
+                _cuda_ext = _import_module_from_library(
+                    "tgengine_cuda", _cache_dir, True
+                )
+            else:
+                from torch.utils.cpp_extension import load as _load_ext
+                _cuda_ext = _load_ext(
+                    name="tgengine_cuda",
+                    sources=[str(_csrc_dir / "temporal_sample.cu")],
+                    verbose=False,
+                )
             HAS_CUDA_EXT = True
+            _cuda_ext_loaded = True
     except Exception:
         pass
 
