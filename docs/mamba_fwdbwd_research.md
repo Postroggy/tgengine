@@ -45,15 +45,19 @@ projection、copy、conv 加起来不到 11%。
   AMP 只加速了 projection 的 mm。所以 13% 是上限附近。
 - **Engine `use_amp` 默认 False**（保守，数值稳定）。Mamba 训练建议显式开。
 
-### 2. torch.compile（不可行 ❌）
-- inductor 后端依赖 triton JIT，运行时 shell 调 `/usr/bin/gcc` 编译 cuda_utils。
-- glibc239 启动方案下，系统 gcc 无法加载 glibc239 的 libc.so.6（需 GLIBC_2.35），
-  inductor 运行时编译崩溃。
-- `tests/conftest.py` 的 env 清理只在 collection 阶段生效，inductor 在 forward
-  时重新 JIT，再次撞 gcc 崩溃。
-- **结论：fast-path 进程下 torch.compile 路线关闭。** 要用 compile 需解决
-  glibc239 + 系统 gcc 的根本冲突（换 conda gcc 或静态链接 inductor runtime），
-  ROI 低，不做。
+### 2. torch.compile（可行但无加速 ⚠️）
+- **之前结论"不可行"是错的**。实际可在 glibc239 下跑通：在 `import mamba_ssm`
+  之后清掉 `LD_LIBRARY_PATH` 的 glibc239 部分（与 `tests/conftest.py` 同法），
+  inductor 的 gcc subprocess 改用系统 glibc 即可编译。验证脚本
+  `benchmarks/ablation/bench_compile_verify.py`。
+- **但实测无加速**：eager 13.91 ms/iter → compiled(reduce-overhead) 14.51 ms/iter
+  = **0.96x（略慢）**。原因：scan kernel 占 87.7% 是 mamba_ssm 闭源 CUDA op，
+  compile 碰不到；compile 只能融合 projection 的 mm+copy（< 11%），而 CUDA graph
+  启动 + dynamo tracing 开销抵消了那点收益。dynamo 还警告无法 trace
+  `selective_scan_cuda`（pybind11 op），SSM 段被 graph-gen 出去再接回。
+- **结论：compile 路线可行但对 Mamba 无收益**，不值得引入复杂度。要提升需把
+  selective_scan_fn 包成 `torch.compiler.allow_in_graph` 的 custom op 并配合
+  CUDA graph 捕获整个 block，工程量大且收益不确定，不做。
 
 ### 3. 减少 contiguous 转置（收益 < 3%）
 - `_SelectiveSSM.forward` 有 4 处 `.contiguous()`，是 selective_scan_fn 对
@@ -79,8 +83,8 @@ task5 的交付为：
 3. e2e 验证：TimeAwareMamba + AMP + async prefetch 组合正确提速（task1×task5 交汇）。
 4. profiling benchmark `bench_mamba_fwdbwd.py` 留作回归工具。
 
-**不做**：torch.compile（glibc239 冲突）、自研 scan kernel、projection micro-opt（< 3%）。
-这些要么不可行，要么 ROI 不足以匹配工程成本。
+**不做**：torch.compile（可行但对 Mamba 0.96x，无收益）、自研 scan kernel、
+projection micro-opt（< 3%）。这些要么无收益，要么 ROI 不足以匹配工程成本。
 
 ## 相关
 

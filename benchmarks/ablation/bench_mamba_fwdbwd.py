@@ -87,15 +87,13 @@ def main():
         )
         print(f"{name:<28} {str(amp):<5} {t:>11.4f} {mem:>9.3f} {params:>10,}")
 
-    # torch.compile is NOT viable under the glibc 2.39 launch scheme:
-    # inductor's triton JIT shells out to /usr/bin/gcc, which cannot load
-    # glibc239's libc.so.6 (system ld-linux is 2.31, needs GLIBC_2.35).
-    # conftest strips glibc239 from LD_LIBRARY_PATH at collection time so
-    # plain triton kernels work, but inductor re-compiles at RUNTIME after
-    # collection, re-hitting the gcc crash. So compile is off the table for
-    # the fast-path process. Documented here so we don't re-try it.
-    print("\n[todo] torch.compile: SKIPPED — inductor triton JIT conflicts with "
-          "glibc239 launcher (gcc can't load glibc239 libc at runtime).")
+    # torch.compile IS viable under glibc 2.39 if LD_LIBRARY_PATH is cleaned
+    # after importing mamba_ssm (see benchmarks/ablation/bench_compile_verify.py).
+    # But it gives 0.96x on Mamba — no speedup, because scan kernel (87.7%) is
+    # a closed mamba_ssm CUDA op that compile can't touch. Not included here;
+    # use bench_compile_verify.py for the compile-vs-eager comparison.
+    print("\n[todo] torch.compile: see bench_compile_verify.py "
+          "(viable but 0.96x — no speedup on Mamba).")
 
     # Per-op breakdown for one TimeAware block via profiler
     print("\n--- Per-op breakdown (TimeAwareMamba, AMP) ---")
