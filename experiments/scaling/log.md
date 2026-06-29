@@ -208,3 +208,62 @@ v3 DDP eval 超过 40min 未完成（被 kill），与 v2 同病：Mamba2/Mamba3
 - conda env `mamba2`：clone PyGBase + causal_conv1d 重编 + mamba-ssm 从源码装（含 Mamba3）
 - Mamba3 SISO 模式（is_mimo=False，避开 TileLang 依赖）
 - 仍需 glibc239 ld-linux 启动（causal_conv1d_cuda + mamba3 kernel 需 GLIBC_2.32）
+
+---
+
+# Mamba2/3 eval 慢 bug 修复（2026-06-29）
+
+## 根因（社区已知 + 本地实测确认）
+
+社区调研：
+- GitHub issue #355 "Mamba2 9x slower inference than Mamba1"——Tri Dao 确认 Mamba2 用 Triton，小模型 CPU overhead 大
+- GitHub issue #389 "mamba2 training very slow"——首次 triton compiler & autotune 慢，需 warmup
+- PyTorch 官方博客 "Accelerating Mamba2 with Kernel Fusion"——默认 5-kernel SSD 慢
+
+本地实测（v2 forward, B=200, K=512, d_model=128）：
+- **cold first forward: 5197 ms**（triton autotune 编译）
+- **hot forward: 5.42 ms**
+- **cold/hot = 958x**
+
+根因：Mamba2/Mamba3 的 SSD triton kernel 在 no_grad（eval）上下文首次编译 ~5s。训练时 cache 在 grad 上下文，eval 的 no_grad 上下文 cache key 不同，首次 eval batch 付 5s cold-start。
+
+## 修复（Engine._evaluate triton warmup）
+
+在 `_evaluate` 的 proto 循环前，用第一个 prepped batch 跑一次 dummy forward（no_grad + autocast，与真实 eval 同上下文），触发 triton autotune 填 cache。后续 eval batch 走 hot path。Best-effort（异常跳过）。
+
+```python
+if prepped:
+    try:
+        warm = self._eval_pipeline.prepare(prepped[0])
+        with torch.no_grad():
+            _ = self._raw_model(warm)
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+```
+
+## 验证（单卡 reddit K=512 v2）
+
+| | eval 时间 | epoch 总时间 |
+|---|---|---|
+| 修复前 | 161s | 414.8s |
+| 修复后 | **42s**（warmup 0s + val 21s + test 21s） | 307.7s |
+
+**eval 从 161s 降到 42s（-74%），接近 v1 的 45s。** warmup 在训练后 cache 已热时 forward 本身 0s，但关键是它在 no_grad + autocast 上下文填了 triton cache key（训练时的 grad 上下文 cache 不适用 eval）。
+
+test_engine 7 个 eval 测试在 mamba2 env 全过——warmup 不破坏 eval 正确性。
+
+## DDP eval 超时（另一个问题，非 triton）
+
+DDP 4 卡 reddit K=512 v2 eval 仍超时（>15min）。排查发现 rank0 训练 487/488 后卡住，`_train_epoch` 返回后的 `all_reduce(train_loss)` 没完成——**DDP 训练/通信问题，不是 triton eval cold-start**。
+
+可能根因：
+- 4 卡异构（1×4080 + 3×3090），DDP 每 batch all_reduce grad 同步，某卡慢拖累
+- NCCL 通信死锁（与 4 卡异构或 NCCL 配置有关）
+- 与 warmup 修复无关（warmup 解决 triton cold-start，DDP 同步是另一层）
+
+**待查**：DDP 4 卡异构的 all_reduce 死锁。可能需 NCCL 配置调整或同构卡测试。
+
+## 环境副作用（已恢复）
+
+mamba2 env 创建时 conda clone 硬链接共享 PyGBase 包，mamba2 的 `pip install --force-reinstall` 升级 torch 时破坏了 PyGBase（torch 2.9.1+cu128 → 2.12.1+cu130，CUDA 13.0 在系统 glibc 下不可用）。已重装 PyGBase torch 2.9.1+cu128 恢复。

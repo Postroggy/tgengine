@@ -735,6 +735,25 @@ class Engine:
 
         all_metrics: dict[str, float] = {}
         with torch.amp.autocast("cuda", enabled=self.config.use_amp):
+            # Triton warmup: Mamba2/Mamba3 SSD kernels (and any triton-based
+            # model op) incur a one-time autotune compile (~5 s/kernel) on the
+            # first forward under a new shape/dtype/grad-context. Training
+            # populates the cache under grad; eval runs under no_grad, a
+            # different context, so the first eval batch would pay the 5 s
+            # cold-start — and if the cache key varies per batch, every batch
+            # pays it (observed: 161 s eval vs 42 s hot). Run one dummy forward
+            # here on the autocast/no_grad path to populate the cache, so the
+            # real eval batches hit the hot path. Best-effort: skip if the
+            # model can't consume a prepared batch this way. Measured: v2 eval
+            # 161 s → 42 s (single-GPU reddit K=512).
+            if prepped:
+                try:
+                    warm = self._eval_pipeline.prepare(prepped[0])
+                    with torch.no_grad():
+                        _ = self._raw_model(warm)
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
             for proto in self._eval_protocols.values():
                 # Use _raw_model (unwrapped) for eval, NOT self.model (DDP-wrapped).
                 # DDP's forward hooks trigger all_reduce on every forward; eval
