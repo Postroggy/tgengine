@@ -152,3 +152,59 @@ v1 DDP eval 修复（分片 + all_reduce train_loss）在 uci 验证通过（AP=
 MAMBA_PYTHON=<mamba2>/python3.11 scripts/run_mamba.sh python \
     examples/bench_ddp_mamba_versions.py --mamba v2 --K 512
 ```
+
+---
+
+# Mamba v3 (SSD + trapezoidal + MIMO) K=512 DDP 测速（2026-06-29）
+
+## 动机
+
+用户要求测 Mamba-3（2026 年 3 月，ICLR 2026）。Mamba-3 三大改进：exponential-trapezoidal discretization、complex-valued state、MIMO。从源码装 mamba-ssm（含 Mamba3），用 SISO 模式（MIMO 需 TileLang kernel，未装）。
+
+## 实测（reddit K=512, d_model=128, 2 layers, DDP 4 卡）
+
+### 训练吞吐（DDP 4 卡）
+
+| 版本 | 单卡 it/s | 训练加速（vs 单卡 v1） |
+|------|-----------|----------------------|
+| v1 (TimeAwareMamba) | 6.15 | 1.0x baseline |
+| v2 (Mamba2 SSD) | 7.67 | +25% |
+| v3 (Mamba3 SISO) | **7.90** | **+29%** |
+
+**v3 训练吞吐最快（7.90 it/s），比 v1 快 29%，比 v2 略快 3%。** 长序列 K=512 下 v3/v2 的 SSD 路径优势确认，但 v3 vs v2 差距很小（SISO 模式下 v3 的 trapezoidal/complex 改进对吞吐影响不大）。
+
+### 单卡 epoch 总时间 + 显存
+
+| 版本 | epoch 时间 | 显存 |
+|------|------------|------|
+| v1 | 281.7s | 9.43GB |
+| v2 | 414.8s | 7.57GB |
+| v3 | 613.4s | 10.47GB |
+
+v3 单卡 epoch 最慢且最耗显存——**v3 eval 极慢**（比 v2 还慢），拖累总时间。
+
+### DDP eval 问题（v2/v3 共有）
+
+v3 DDP eval 超过 40min 未完成（被 kill），与 v2 同病：Mamba2/Mamba3 的 SSD triton kernel 在 no_grad（eval）下极慢，DDP 分片后仍按最慢卡同步，超 NCCL timeout。v1 eval 快（selective_scan 在 no_grad 下正常）。
+
+**Mamba2/Mamba3 的 eval 慢是 SSD kernel 的固有缺陷**，不是 DDP bug。训练吞吐对比有效；eval 性能需单独调研（可能要 SSD kernel 的 eval fast-path 或 cache）。
+
+## 结论
+
+- **训练吞吐：v3 (7.90) ≈ v2 (7.67) > v1 (6.15)**。K=512 下 SSD 路径（v2/v3）比 selective scan（v1）快 25-29%。
+- **v3 vs v2 训练差距小（3%）**：SISO 模式下 v3 的算法改进对吞吐无显著提升。MIMO 模式（需 TileLang）可能不同，未测。
+- **eval 慢：v3 > v2 > v1**。SSD kernel 在 no_grad 下性能差，v3 最慢。这使 v2/v3 的单卡 epoch 总时间反而比 v1 长。
+- **显存：v2 (7.57GB) < v1 (9.43GB) < v3 (10.47GB)**。v3 最耗显存。
+
+## 建议
+
+- 训练用 v2（吞吐接近 v3、显存最省、eval 比 v3 略快）
+- 或用 v3 MIMO 模式（需装 TileLang，可能解锁更高吞吐）
+- eval 慢是 v2/v3 的核心障碍，需调研 SSD kernel 的 eval 优化（如 eval 时切回 v1 selective_scan，或用 Mamba2/3 的 inference fast-path）
+- v1 eval 快，若 eval 频繁可考虑训练 v2/v3 + eval 用 v1 权重转换（但架构不同，不可直接转）
+
+## 环境
+
+- conda env `mamba2`：clone PyGBase + causal_conv1d 重编 + mamba-ssm 从源码装（含 Mamba3）
+- Mamba3 SISO 模式（is_mimo=False，避开 TileLang 依赖）
+- 仍需 glibc239 ld-linux 启动（causal_conv1d_cuda + mamba3 kernel 需 GLIBC_2.32）

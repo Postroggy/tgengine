@@ -9,7 +9,7 @@ pytest.importorskip("mamba_ssm")
 
 import torch
 
-from tgengine.nn.mamba_block import Mamba2Block, MambaBlock, TimeAwareMambaBlock
+from tgengine.nn.mamba_block import Mamba2Block, Mamba3Block, MambaBlock, TimeAwareMambaBlock
 
 
 def _cuda():
@@ -226,3 +226,64 @@ def test_mamba2_block_runs_under_compile():
         y_compiled = blk_c(x)
     assert torch.allclose(y_eager, y_compiled, atol=1e-3), \
         f"Mamba2Block compile diverged: max diff {(y_eager-y_compiled).abs().max()}"
+
+
+# ---------------------------------------------------------------------------
+# Mamba3Block (SSD + trapezoidal + MIMO)
+# ---------------------------------------------------------------------------
+
+# Mamba3 requires mamba_ssm built from source (MAMBA_FORCE_BUILD). Skip if absent.
+try:
+    from mamba_ssm import Mamba3  # noqa: F401
+    _HAS_MAMBA3 = True
+except ImportError:
+    _HAS_MAMBA3 = False
+
+mamba3_required = pytest.mark.skipif(not _HAS_MAMBA3, reason="mamba_ssm.Mamba3 not installed")
+
+
+@mamba3_required
+def test_mamba3_block_output_shape():
+    dev = _cuda()
+    blk = Mamba3Block(d_model=64, d_state=64, expand=2).to(dev)
+    x = torch.randn(4, 10, 64, device=dev)
+    out = blk(x)
+    assert out.shape == (4, 10, 64)
+
+
+@mamba3_required
+def test_mamba3_block_residual_finite():
+    dev = _cuda()
+    blk = Mamba3Block(d_model=64, d_state=64, expand=2).to(dev)
+    blk.eval()
+    x = torch.randn(2, 8, 64, device=dev)
+    out = blk(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
+@mamba3_required
+def test_mamba3_block_backward():
+    dev = _cuda()
+    blk = Mamba3Block(d_model=64, d_state=64, expand=2).to(dev)
+    x = torch.randn(2, 8, 64, device=dev, requires_grad=True)
+    out = blk(x)
+    out.sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    has_grad = any(p.grad is not None and torch.isfinite(p.grad).all()
+                   for p in blk.mamba3.parameters())
+    assert has_grad
+
+
+@mamba3_required
+def test_mamba3_block_headdim_auto_pick():
+    """Small d_model where default headdim=64 doesn't divide d_inner should
+    auto-pick a smaller headdim instead of crashing."""
+    dev = _cuda()
+    # d_model=24, expand=2 → d_inner=48, 48%64!=0 → auto headdim=16
+    blk = Mamba3Block(d_model=24, d_state=32, expand=2).to(dev)
+    assert blk.headdim in (16, 8)
+    x = torch.randn(2, 8, 24, device=dev)
+    out = blk(x)
+    assert out.shape == (2, 8, 24)

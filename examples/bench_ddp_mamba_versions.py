@@ -33,13 +33,15 @@ from tgengine.models.base import TemporalModel
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "benchmarks", "ablation"))
 
 
-class _MiniMamba2Model(TemporalModel):
-    """Same structure as _MiniMambaModel but Mamba2Block backbone (no Δt)."""
+class _MiniMamba23Model(TemporalModel):
+    """Generic Mamba2/Mamba3 backbone model (no external Δt; both blocks are
+    pure sequence models). Used for v2 and v3 benchmarks — only the block
+    class differs."""
 
-    def __init__(self, num_nodes, d_model=128, K=512, n_layers=2, d_state=128):
+    def __init__(self, num_nodes, block_class, d_model=128, K=512, n_layers=2,
+                 d_state=128, **block_kwargs):
         super().__init__()
         from tgengine.core.gather_spec import GatherSpec, NeighborSpec
-        from tgengine.nn.mamba_block import Mamba2Block
 
         self.K = K
         self.d_model = d_model
@@ -49,7 +51,7 @@ class _MiniMamba2Model(TemporalModel):
         self.node_emb = torch.nn.Embedding(num_nodes, d_model)
         self.edge_time_proj = torch.nn.Linear(1, d_model)
         self.layers = torch.nn.ModuleList([
-            Mamba2Block(d_model, d_state=d_state, expand=2) for _ in range(n_layers)
+            block_class(d_model, d_state=d_state, **block_kwargs) for _ in range(n_layers)
         ])
         self.norm = torch.nn.LayerNorm(d_model)
 
@@ -60,7 +62,7 @@ class _MiniMamba2Model(TemporalModel):
         x = x + self.edge_time_proj(dt)
         h = x
         for layer in self.layers:
-            h = layer(h)  # Mamba2Block has no dt arg
+            h = layer(h)  # Mamba2/Mamba3 blocks have no dt arg
         h = self.norm(h)
         last_idx = nbr.mask.long().sum(dim=1) - 1
         last_idx = last_idx.clamp(min=0)
@@ -75,7 +77,6 @@ class _MiniMamba2Model(TemporalModel):
         return EmbeddingBundle(src=src, dst=dst, neg=neg)
 
     def forward(self, batch):
-        # Engine backward-compat: forward → encode → link pred loss
         from tgengine.models.base import ModelOutput
         import torch.nn.functional as F
         bundle = self.encode(batch)
@@ -101,7 +102,7 @@ def main():
     torch.cuda.set_device(local_rank)
 
     p = argparse.ArgumentParser()
-    p.add_argument("--mamba", choices=["v1", "v2"], default="v2")
+    p.add_argument("--mamba", choices=["v1", "v2", "v3"], default="v3")
     p.add_argument("--dataset", default="reddit")
     p.add_argument("--data_root", default="/mnt/home/gyq/CodeBase/Graph/DG_Data")
     p.add_argument("--epochs", type=int, default=2)
@@ -133,8 +134,11 @@ def main():
         model = _MiniMambaModel(ds.num_nodes, d_model=args.d_model, K=args.K,
                                 n_layers=args.n_layers).to("cuda")
     else:
-        model = _MiniMamba2Model(ds.num_nodes, d_model=args.d_model, K=args.K,
-                                 n_layers=args.n_layers).to("cuda")
+        from tgengine.nn.mamba_block import Mamba2Block, Mamba3Block
+        block_class = Mamba3Block if args.mamba == "v3" else Mamba2Block
+        model = _MiniMamba23Model(ds.num_nodes, block_class,
+                                  d_model=args.d_model, K=args.K,
+                                  n_layers=args.n_layers, expand=2).to("cuda")
     neg = RandomNegative(ds.num_nodes)
 
     config = TrainConfig(epochs=args.epochs, lr=1e-3, device="cuda",

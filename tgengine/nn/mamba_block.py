@@ -291,6 +291,113 @@ class Mamba2Block(nn.Module):
         return residual + y
 
 
+def _require_mamba3():
+    """Import the Mamba3 class or raise a clear error."""
+    try:
+        from mamba_ssm import Mamba3  # type: ignore[import-untyped]
+    except ImportError as e:  # pragma: no cover - feature gated
+        raise ImportError(
+            "Mamba3Block requires mamba_ssm with Mamba3. Install from source: "
+            "MAMBA_FORCE_BUILD=TRUE pip install --force-reinstall "
+            "git+https://github.com/state-spaces/mamba.git --no-build-isolation "
+            "(see AGENTS.md §2 for the glibc 2.39 launcher)."
+        ) from e
+    return Mamba3
+
+
+@torch.compiler.disable
+def _mamba3_call(mamba3: nn.Module, h: Tensor) -> Tensor:
+    """Run Mamba3 under a torch.compiler.disable boundary (SSD/triton kernels
+    can't be traced by dynamo). Same pattern as v1/v2 wrappers."""
+    return mamba3(h)
+
+
+class Mamba3Block(nn.Module):
+    """Mamba-3 block: pre-norm + residual.
+
+    Mamba-3 (ICLR 2026, Lahoti et al.) adds three improvements over Mamba-2:
+      - exponential-trapezoidal discretization (richer state dynamics)
+      - complex-valued state updates (better state tracking)
+      - MIMO (Multi-Input Multi-Output) formulation for higher hardware
+        utilization during decoding
+    It targets the inference-efficiency Pareto frontier and is reported
+    faster than Mamba-2 at comparable quality.
+
+    Like Mamba2Block, dt is input-dependent internally and does NOT accept an
+    external Δt signal — time-awareness must come from rotary time encoding on
+    the input tokens.
+
+    Args:
+        d_model: hidden dimension.
+        d_state: SSM state size.
+        expand: inner expansion (d_inner = d_model * expand). Default 2.
+        headdim: SSM head dimension. d_inner must be divisible by this.
+            Default 64; auto-picks smaller if d_inner doesn't divide.
+        is_mimo: enable MIMO mode (default False — SISO mode, which needs no
+            extra kernels and is directly comparable to Mamba-2 per the paper.
+            MIMO requires the TileLang MIMO kernels; set True only if those
+            are installed).
+        mimo_rank: MIMO rank (default 4). chunk_size derived from it:
+            bf16 → 64/mimo_rank, else 32/mimo_rank.
+        dtype: Mamba3 internal dtype. Default float32 to match the other
+            blocks; pass torch.bfloat16 for the paper's default. Under
+            Engine AMP, autocast handles mixed precision regardless.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 128,
+        expand: int = 2,
+        headdim: int = 64,
+        is_mimo: bool = False,
+        mimo_rank: int = 4,
+        dtype: "torch.dtype" = torch.float32,
+        chunk_size: "int | None" = None,
+    ):
+        super().__init__()
+        Mamba3 = _require_mamba3()
+        d_inner = d_model * expand
+        if d_inner % headdim != 0:
+            for cand in (64, 32, 16, 8):
+                if d_inner % cand == 0:
+                    headdim = cand
+                    break
+            else:
+                raise ValueError(
+                    f"d_model*expand={d_inner} not divisible by any supported headdim"
+                )
+        if chunk_size is None:
+            # MIMO: bf16 → 64/mimo_rank, else 32/mimo_rank (per Mamba-3 README).
+            # SISO: use 64 (the SSD triton kernel requires chunk K >= 16, and
+            # larger chunks amortize launch overhead for the SISO path).
+            if is_mimo:
+                chunk_size = (64 if dtype == torch.bfloat16 else 32) // mimo_rank
+            else:
+                chunk_size = 64
+            chunk_size = max(chunk_size, 16)
+        self.d_model = d_model
+        self.headdim = headdim
+        self.norm = nn.LayerNorm(d_model)
+        self.mamba3 = Mamba3(
+            d_model=d_model,
+            d_state=d_state,
+            expand=expand,
+            headdim=headdim,
+            is_mimo=is_mimo,
+            mimo_rank=mimo_rank,
+            chunk_size=chunk_size,
+            dtype=dtype,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Args: x (B, L, d_model). Returns (B, L, d_model)."""
+        residual = x
+        h = self.norm(x)
+        y = _mamba3_call(self.mamba3, h)
+        return residual + y
+
+
 @torch.compiler.disable
 def _mamba2_call(mamba2: nn.Module, h: Tensor) -> Tensor:
     """Run Mamba2 under a torch.compiler.disable boundary so torch.compile
