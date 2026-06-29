@@ -24,9 +24,11 @@ def main():
     dist_avail = torch.distributed.is_available() and world_size > 1
 
     if dist_avail and not torch.distributed.is_initialized():
+        import datetime
         torch.distributed.init_process_group(
             backend="nccl",
             device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=datetime.timedelta(minutes=120),
         )
     torch.cuda.set_device(local_rank)
 

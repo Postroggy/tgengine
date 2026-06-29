@@ -476,11 +476,9 @@ class Engine:
                 if val_score == 0.0 and val_metrics:
                     val_score = next(iter(val_metrics.values()))
 
-                # DDP: average val_score across ranks so all ranks agree on is_best
-                if self._distributed:
-                    val_score_t = torch.tensor(val_score, device=self.config.device)
-                    torch.distributed.all_reduce(val_score_t, op=torch.distributed.ReduceOp.AVG)
-                    val_score = val_score_t.item()
+                # Note: no DDP all_reduce needed here. _evaluate() broadcasts
+                # rank 0's metrics to all ranks, so val_score and val_metrics
+                # are already identical across ranks.
 
                 # Determine is_best based on stopping_rule
                 if self.config.stopping_rule == "all_improve":
@@ -704,73 +702,85 @@ class Engine:
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
         """Run all registered eval protocols; return merged metrics dict.
 
-        DDP: shard eval_batches across ranks (each rank evals its slice) and
-        all_reduce metrics (averaged). This cuts eval wall-clock ~world_size
-        and avoids 4 ranks each running the full val/test set, which exceeded
-        NCCL's default timeout on large graphs. Shards are contiguous slices
-        so per-rank AP is over a comparable sample; the averaged metric drives
-        early stopping (not a final reported number).
+        DDP: only rank 0 runs eval (all ranks share identical weights via DDP
+        gradient sync, so rank 0's result is representative). Metrics are then
+        broadcast to all ranks so every rank makes the same is_best decision.
+
+        Why rank-0-only instead of shard + all_reduce: heterogeneous GPUs
+        (e.g. 1x RTX 4080 + 3x RTX 3090) finish their shards at very
+        different wall-clock times. The all_reduce at the end blocks until
+        the slowest rank arrives; for slow eval models (Mamba2/3 SSD under
+        no_grad) this exceeds NCCL's default 30-min timeout. Rank-0-only
+        eliminates the cross-rank eval sync entirely. The only collective is
+        a single small broadcast (~100 bytes) after eval completes.
         """
         model_state = self._raw_model.freeze()
         for head in self._tasks.values():
             head.eval()
 
-        # DDP shard: rank r gets batches[r::world_size].
-        if self._distributed and self._world_size > 1 and len(eval_batches) >= self._world_size:
-            sharded = eval_batches[self._rank::self._world_size]
-        else:
-            sharded = eval_batches
-
-        prepped = []
-        for rb in sharded:
-            if rb.neg is None:
-                neg = self.eval_neg_strategy.sample(rb.src, rb.dst, rb.time,
-                                                    self._eval_graph, rb.edge_indices)
-                rb = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
-                              edge_feat=rb.edge_feat, neg=neg,
-                              edge_indices=rb.edge_indices,
-                              node_labels=rb.node_labels,
-                              edge_labels=rb.edge_labels)
-            prepped.append(rb)
-
+        # DDP: only rank 0 runs eval forward passes. All ranks share DDP-synced
+        # weights, so rank 0's metrics are identical to what any other rank
+        # would compute. Other ranks skip straight to the broadcast below.
         all_metrics: dict[str, float] = {}
-        with torch.amp.autocast("cuda", enabled=self.config.use_amp):
-            # Triton warmup: Mamba2/Mamba3 SSD kernels (and any triton-based
-            # model op) incur a one-time autotune compile (~5 s/kernel) on the
-            # first forward under a new shape/dtype/grad-context. Training
-            # populates the cache under grad; eval runs under no_grad, a
-            # different context, so the first eval batch would pay the 5 s
-            # cold-start — and if the cache key varies per batch, every batch
-            # pays it (observed: 161 s eval vs 42 s hot). Run one dummy forward
-            # here on the autocast/no_grad path to populate the cache, so the
-            # real eval batches hit the hot path. Best-effort: skip if the
-            # model can't consume a prepared batch this way. Measured: v2 eval
-            # 161 s → 42 s (single-GPU reddit K=512).
-            if prepped:
-                try:
-                    warm = self._eval_pipeline.prepare(prepped[0])
-                    with torch.no_grad():
-                        _ = self._raw_model(warm)
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
-            for proto in self._eval_protocols.values():
-                # Use _raw_model (unwrapped) for eval, NOT self.model (DDP-wrapped).
-                # DDP's forward hooks trigger all_reduce on every forward; eval
-                # sharding means ranks run different batch counts, which would
-                # deadlock DDP. The unwrapped model has no such hooks.
-                metrics = proto.evaluate(
-                    self._raw_model, self._eval_pipeline, prepped, self._eval_graph
-                )
-                all_metrics.update(metrics)
+        run_eval = not self._distributed or self._rank == 0
 
-        # DDP: average metrics across ranks (each computed over its shard).
+        if run_eval:
+            prepped = []
+            for rb in eval_batches:
+                if rb.neg is None:
+                    neg = self.eval_neg_strategy.sample(rb.src, rb.dst, rb.time,
+                                                        self._eval_graph, rb.edge_indices)
+                    rb = RawBatch(src=rb.src, dst=rb.dst, time=rb.time,
+                                  edge_feat=rb.edge_feat, neg=neg,
+                                  edge_indices=rb.edge_indices,
+                                  node_labels=rb.node_labels,
+                                  edge_labels=rb.edge_labels)
+                prepped.append(rb)
+
+            with torch.amp.autocast("cuda", enabled=self.config.use_amp):
+                # Triton warmup: Mamba2/Mamba3 SSD kernels (and any triton-based
+                # model op) incur a one-time autotune compile (~5 s/kernel) on the
+                # first forward under a new shape/dtype/grad-context. Training
+                # populates the cache under grad; eval runs under no_grad, a
+                # different context, so the first eval batch would pay the 5 s
+                # cold-start — and if the cache key varies per batch, every batch
+                # pays it (observed: 161 s eval vs 42 s hot). Run one dummy forward
+                # here on the autocast/no_grad path to populate the cache, so the
+                # real eval batches hit the hot path. Best-effort: skip if the
+                # model can't consume a prepared batch this way. Measured: v2 eval
+                # 161 s → 42 s (single-GPU reddit K=512).
+                if prepped:
+                    try:
+                        warm = self._eval_pipeline.prepare(prepped[0])
+                        with torch.no_grad():
+                            _ = self._raw_model(warm)
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                for proto in self._eval_protocols.values():
+                    # Use _raw_model (unwrapped) for eval, NOT self.model
+                    # (DDP-wrapped). DDP's forward hooks trigger gradient
+                    # all_reduce on every forward, which is unwanted in eval.
+                    metrics = proto.evaluate(
+                        self._raw_model, self._eval_pipeline, prepped, self._eval_graph
+                    )
+                    all_metrics.update(metrics)
+
+        # DDP: broadcast metrics from rank 0 to all other ranks. Single small
+        # collective — no per-batch sync, no cross-rank eval computation.
         if self._distributed:
             keys = sorted(all_metrics.keys())
+            key_list = [keys]
+            torch.distributed.broadcast_object_list(key_list, src=0)
+            keys = key_list[0]
             if keys:
-                buf = torch.tensor([all_metrics[k] for k in keys],
-                                   device=self.config.device, dtype=torch.float32)
-                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.AVG)
+                if self._rank == 0:
+                    buf = torch.tensor([all_metrics[k] for k in keys],
+                                       device=self.config.device, dtype=torch.float64)
+                else:
+                    buf = torch.zeros(len(keys),
+                                      device=self.config.device, dtype=torch.float64)
+                torch.distributed.broadcast(buf, src=0)
                 all_metrics = {k: float(v) for k, v in zip(keys, buf.tolist())}
 
         self._raw_model.thaw(model_state)

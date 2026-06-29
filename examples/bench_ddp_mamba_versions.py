@@ -97,7 +97,7 @@ def main():
         torch.distributed.init_process_group(
             backend="nccl",
             device_id=torch.device(f"cuda:{local_rank}"),
-            timeout=datetime.timedelta(minutes=60),
+            timeout=datetime.timedelta(minutes=120),
         )
     torch.cuda.set_device(local_rank)
 

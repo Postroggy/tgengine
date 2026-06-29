@@ -29,6 +29,8 @@ if [ ! -x "$PY" ]; then
     exit 1
 fi
 
+# Single-GPU default: only GPU 1 (RTX 4080). For DDP multi-GPU, override:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_mamba.sh python -m torch.distributed.run ...
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export TRITON_LIBCUDA_PATH="${TRITON_LIBCUDA_PATH:-/lib/x86_64-linux-gnu}"
 export LD_LIBRARY_PATH="$SYSROOT/lib64:$SYSROOT/lib:$TORCH_LIB:$CUDA_LIB"

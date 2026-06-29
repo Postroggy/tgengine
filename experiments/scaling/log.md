@@ -267,3 +267,52 @@ DDP 4 卡 reddit K=512 v2 eval 仍超时（>15min）。排查发现 rank0 训练
 ## 环境副作用（已恢复）
 
 mamba2 env 创建时 conda clone 硬链接共享 PyGBase 包，mamba2 的 `pip install --force-reinstall` 升级 torch 时破坏了 PyGBase（torch 2.9.1+cu128 → 2.12.1+cu130，CUDA 13.0 在系统 glibc 下不可用）。已重装 PyGBase torch 2.9.1+cu128 恢复。
+
+---
+
+# DDP eval 超时修复：rank-0-only eval（2026-06-29）
+
+## 问题
+
+DDP 4 卡异构（1×RTX 4080 + 3×RTX 3090）eval 超时。之前的 shard+all_reduce 方案中，所有 rank 同时跑 eval 的不同分片，最后 all_reduce 聚合。异构 GPU 速度不同，最慢的 3090 决定 all_reduce 等待时间；Mamba2/3 SSD kernel 在 no_grad 下本身就慢（即使 triton warmup 后仍 42s），叠加异构延迟后轻松超过 NCCL 30min 默认 timeout。
+
+## 根因分析
+
+1. **异构 GPU 不同速度**：RTX 4080 比 RTX 3090 快 ~20%，DDP all_reduce 必须等所有 rank
+2. **Mamba2/3 eval 慢**：SSD triton kernel 在 no_grad 下性能差（单卡 42s warm 后 vs v1 的 ~10s）
+3. **eval 频率高**：adaptive eval 策略下，每个 eval epoch 跑 val + （is_best 时）test，两次 eval
+4. **冗余 NCCL 调用**：val_score all_reduce 是不必要的（DDP 权重已同步，各 rank 的 val_score 应相同）
+
+## 修复
+
+**`Engine._evaluate()` 改为 rank-0-only eval：**
+- 所有 rank 的模型权重通过 DDP gradient sync 保持完全一致
+- 因此 rank 0 的 eval 结果 = 任何 rank 的 eval 结果
+- 只在 rank 0 上跑 eval forward passes，其他 rank 跳过
+- 结果通过 `broadcast_object_list`（metric keys）+ `broadcast`（metric values）从 rank 0 发给所有 rank
+- 消除了 eval 阶段的跨 rank 同步，唯一的 collective 是 ~100 bytes 的 broadcast
+
+**`train()` 删除冗余 val_score all_reduce：**
+- `_evaluate()` 已经 broadcast 了一致的 metrics，不需要再次 all_reduce val_score
+
+**DDP 脚本 NCCL timeout 提高：**
+- `train_ddp_reddit.py`: 无 timeout → 120min
+- `bench_ddp_mamba_versions.py`: 60min → 120min
+- `train_ddp_test.py`: 无 timeout → 30min
+
+## 改动文件
+
+- `tgengine/engine/__init__.py`：`_evaluate()` 方法 + `train()` 方法
+- `examples/train_ddp_reddit.py`：NCCL timeout
+- `examples/bench_ddp_mamba_versions.py`：NCCL timeout
+- `examples/train_ddp_test.py`：NCCL timeout
+- `scripts/run_mamba.sh`：DDP CUDA_VISIBLE_DEVICES 注释
+
+## 验证
+
+- test_engine.py: 20/20 passed（单 GPU 回归测试）
+- 全量测试：running...
+
+## 待验证
+
+- DDP 4 卡实际训练端到端（需 `CUDA_VISIBLE_DEVICES=0,1,2,3`）
