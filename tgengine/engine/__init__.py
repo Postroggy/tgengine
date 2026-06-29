@@ -714,8 +714,14 @@ class Engine:
         all_metrics: dict[str, float] = {}
         with torch.amp.autocast("cuda", enabled=self.config.use_amp):
             for proto in self._eval_protocols.values():
+                # Use _raw_model (unwrapped) for eval, NOT self.model (DDP-wrapped).
+                # DDP's forward hooks trigger all_reduce on every forward; if ranks
+                # run eval batches out of sync (e.g. different batch counts under
+                # adaptive eval, or eval-only-on-rank-0 schemes), DDP deadlocks
+                # with NCCL timeout. The unwrapped model has no such hooks, so each
+                # rank evals independently; metrics are all_reduced afterwards.
                 metrics = proto.evaluate(
-                    self.model, self._eval_pipeline, prepped, self._eval_graph
+                    self._raw_model, self._eval_pipeline, prepped, self._eval_graph
                 )
                 all_metrics.update(metrics)
 

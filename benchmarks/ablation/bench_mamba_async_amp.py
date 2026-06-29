@@ -32,6 +32,11 @@ class _MiniMambaModel(TemporalModel):
         super().__init__()
         self.K = K
         self.d_model = d_model
+        # Override the class-level gather_spec so the passed K actually drives
+        # neighbor sampling (the class attr defaults to k=32).
+        self.gather_spec = GatherSpec(
+            neighbors=NeighborSpec(k=K, for_nodes=("src", "dst", "neg"))
+        )
         self.node_emb = nn.Embedding(num_nodes, d_model)
         self.edge_time_proj = nn.Linear(1, d_model)
         self.layers = nn.ModuleList([
