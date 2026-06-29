@@ -311,8 +311,52 @@ DDP 4 卡异构（1×RTX 4080 + 3×RTX 3090）eval 超时。之前的 shard+all_
 ## 验证
 
 - test_engine.py: 20/20 passed（单 GPU 回归测试）
-- 全量测试：running...
+- 全量测试：255 passed, 1 failed (pre-existing cuDNN env issue), 10 skipped
 
 ## 待验证
 
 - DDP 4 卡实际训练端到端（需 `CUDA_VISIBLE_DEVICES=0,1,2,3`）
+
+---
+
+# Mamba3 MIMO 模式：TileLang 安装 + 测速（2026-06-30）
+
+## 安装
+
+TileLang 安装成功（mamba2 env）：
+- `tilelang==0.1.8`（Mamba3 setup.py 要求此版本）
+- `apache-tvm-ffi==0.1.9`（`<=0.1.9`，更高版本与 TileLang 0.1.8 的 TVM FFI 冲突）
+- `z3-solver==4.15.4.0`（提供 `libz3.so.4.15`，TileLang TVM 依赖）
+- `ml-dtypes`、`torch-c-dlpack-ext`（TileLang 依赖）
+
+⚠️ **不要用 `tilelang==0.1.11`**：`libtvm_compiler.so` 与 `apache-tvm-ffi 0.1.9` 有 symbol 不匹配（`_ZN3tvm3ffi9ReprPrintERKNS0_3AnyE` undefined）。Mamba3 setup.py 明确 pin 了版本。
+
+运行方式：glibc239 launcher + `setup_mamba_env()` 必须在 `import tilelang` 之前调用（strip glibc239 以免 TVM 编译子进程报错）。
+
+## 实测（B=4, d_model=128, d_state=128, headdim=64, RTX 4080）
+
+| 模式 | L=64 fwd | 备注 |
+|------|----------|------|
+| SISO (chunk=64) | **1.39 ms** | triton SSD kernel，快 |
+| MIMO r=4 (chunk=8) | **265 ms** | TileLang kernel cache 极慢 |
+
+**MIMO 比 SISO 慢 ~190x。** 根因：TileLang 0.1.8 的 kernel cache lookup 每次调用 ~5ms，MIMO forward 触发大量 kernel cache lookup，CPU overhead 远大于 GPU compute。TileLang 日志建议 "use `@tilelang.jit` instead of direct kernel caching"——Mamba3 MIMO 用的是旧式 cache API。
+
+## 结论
+
+- **TileLang MIMO 已装好、forward/backward 都能跑**，但在 RTX 4080 + TileLang 0.1.8 上性能极差
+- MIMO 的核心卖点（多通道并行 decode）在小 d_model=128 上优势不明显，而 TileLang cache overhead 吞噬了所有收益
+- **SISO 模式（triton SSD）仍然是 Mamba3 训练的最佳选择**
+- MIMO 可能需要：(1) 更大 d_model（256+）才有足够并行度，(2) H100/A100 级硬件（TileLang 对 Hopper 优化更好），(3) 更新版 TileLang 修复 cache overhead
+
+## 建议
+
+**预训练 backbone 选择**：Mamba3 SISO（triton SSD）或 Mamba2 SSD，不使用 MIMO。两者训练吞吐接近（v3 7.90 vs v2 7.67 it/s），v3 SISO 有 trapezoidal discretization 的理论优势。
+
+## 环境
+
+```bash
+# mamba2 env 新增包
+pip install tilelang==0.1.8 "apache-tvm-ffi<=0.1.9" z3-solver==4.15.4.0 \
+    ml-dtypes torch-c-dlpack-ext --index-url https://pypi.org/simple/
+```

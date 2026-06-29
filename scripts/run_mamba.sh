@@ -16,7 +16,10 @@ set -euo pipefail
 
 SYSROOT="${MAMBA_GLIBC_SYSROOT:-$HOME/glibc239}"
 PY="${MAMBA_PYTHON:-/mnt/home/gyq/.conda/envs/PyGBase/bin/python3.11}"
-TORCH_LIB="/mnt/home/gyq/.conda/envs/PyGBase/lib/python3.11/site-packages/torch/lib"
+# Auto-detect env lib paths from PY location
+ENV_DIR="$(dirname "$(dirname "$PY")")"
+TORCH_LIB="${MAMBA_TORCH_LIB:-$ENV_DIR/lib/python3.11/site-packages/torch/lib}"
+Z3_LIB="$ENV_DIR/lib/python3.11/site-packages/z3/lib"
 CUDA_LIB="${MAMBA_CUDA_LIB:-$HOME/cuda128/lib64}"
 
 if [ ! -x "$SYSROOT/lib64/ld-linux-x86-64.so.2" ]; then
@@ -33,7 +36,7 @@ fi
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_mamba.sh python -m torch.distributed.run ...
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export TRITON_LIBCUDA_PATH="${TRITON_LIBCUDA_PATH:-/lib/x86_64-linux-gnu}"
-export LD_LIBRARY_PATH="$SYSROOT/lib64:$SYSROOT/lib:$TORCH_LIB:$CUDA_LIB"
+export LD_LIBRARY_PATH="$SYSROOT/lib64:$SYSROOT/lib:$TORCH_LIB:$Z3_LIB:$CUDA_LIB"
 
 # Decide form: `python` passthrough bypasses the runner (raw interpreter
 # semantics for -c / REPL, no triton/inductor so no env strip needed).
