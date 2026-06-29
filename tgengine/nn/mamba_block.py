@@ -49,6 +49,24 @@ def _require_mamba():
     return _fn
 
 
+# Wrap the selective_scan call in torch.compiler.disable so torch.compile
+# can be used on models containing Mamba blocks. dynamo graph-breaks cleanly
+# at this call (the SSM is a closed mamba_ssm CUDA op that cannot be traced),
+# the SSM runs eager with its own autograd backward intact, and inductor
+# fuses the surrounding projections. Measured 1.06x vs eager on the block
+# (projection fusion outweighs the graph-break overhead).
+#
+# Why not allow_in_graph / custom_op: AOTAutograd still traces into an
+# allow_in_graph wrapper with FakeTensor and hits "Cannot access data
+# pointer" from selective_scan_cuda; custom_op would require a hand-written
+# backward (selective_scan's bwd is a closed CUDA kernel), impractical.
+# torch.compiler.disable is the PyTorch-blessed path for "exclude this
+# C++ call from compile, keep its autograd".
+@torch.compiler.disable
+def _selective_scan_call(fn, u, delta, A, B, C, D, delta_bias):
+    return fn(u, delta, A, B, C, D=D, delta_bias=delta_bias, delta_softplus=True)
+
+
 class _SelectiveSSM(nn.Module):
     """S6 selective state space model via the mamba_ssm CUDA kernel."""
 
@@ -95,11 +113,8 @@ class _SelectiveSSM(nn.Module):
             delta_no_bias = delta_no_bias + extra_delta.transpose(1, 2).contiguous()
         B_t = B_ssm.transpose(1, 2).contiguous()
         C_t = C_ssm.transpose(1, 2).contiguous()
-        y = selective_scan_fn(
-            u, delta_no_bias, A, B_t, C_t,
-            D=self.D,
-            delta_bias=delta_bias,
-            delta_softplus=True,
+        y = _selective_scan_call(
+            selective_scan_fn, u, delta_no_bias, A, B_t, C_t, self.D, delta_bias,
         )
         return y.transpose(1, 2)
 

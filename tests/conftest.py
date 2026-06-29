@@ -10,13 +10,11 @@ tgengine_cuda) are already imported and loaded into the process, so the
 glibc239 entries in LD_LIBRARY_PATH are no longer needed by Python itself.
 Strip them so subprocess calls to system tooling succeed. No-op when not
 running under glibc239 (e.g. local macOS).
+
+Logic lives in tgengine.utils.mamba_env so training entry points reuse it.
 """
-import os
+from tgengine.utils.mamba_env import setup_mamba_env
 
 
 def pytest_collection_modifyitems(items):
-    lp = os.environ.get("LD_LIBRARY_PATH", "")
-    if not lp or "glibc239" not in lp:
-        return
-    cleaned = [p for p in lp.split(":") if p and "glibc239" not in p]
-    os.environ["LD_LIBRARY_PATH"] = ":".join(cleaned)
+    setup_mamba_env()
