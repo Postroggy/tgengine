@@ -210,3 +210,89 @@ class TimeAwareMambaBlock(MambaBlock):
 
         y = self.ssm(x_branch, delta_bias=self.ssm._dt_bias(), extra_delta=extra_delta) * F.silu(z)
         return residual + self.out_proj(y)
+
+
+def _require_mamba2():
+    """Import the Mamba2 class or raise a clear error."""
+    try:
+        from mamba_ssm import Mamba2  # type: ignore[import-untyped]
+    except ImportError as e:  # pragma: no cover - feature gated
+        raise ImportError(
+            "Mamba2Block requires mamba_ssm with Mamba2 (mamba_ssm >= 2.0). "
+            "Install/upgrade mamba_ssm or run under the glibc 2.39 ld-linux "
+            "launcher (see AGENTS.md §2)."
+        ) from e
+    return Mamba2
+
+
+class Mamba2Block(nn.Module):
+    """Mamba-2 (SSD) block: pre-norm + residual.
+
+    Mamba-2 uses the State-Space Duality (SSD) algorithm — a chunked,
+    hardware-efficient formulation whose compute scales as O(L·d²·h) vs
+    Mamba-1's O(L·d·n) (n = d_state). For LONG sequences the SSD path is
+    markedly faster on modern GPUs (tensor cores), which is the motivation
+    for using it at K=512. For short sequences Mamba-1 is typically faster
+    (smaller constant). See Mamba-2 paper (Dao/Gu 2024).
+
+    Unlike TimeAwareMambaBlock, Mamba2's dt is input-dependent internally
+    (via its own x_proj) and does NOT accept an external Δt control signal —
+    the SSD kernel's API doesn't expose delta injection. So this block is a
+    pure sequence model: time-awareness, if needed, must come from rotary
+    time encoding on the input tokens (the foundation model's design).
+
+    Args:
+        d_model: hidden dimension. d_model*expand must be divisible by headdim.
+        d_state: SSM state size (Mamba2 calls this d_ssm internally).
+        d_conv: conv1d kernel width.
+        expand: inner expansion (d_inner = d_model * expand).
+        headdim: SSD head dimension. d_inner must be divisible by this.
+            Default 64. For small d_model use headdim=32 or 16.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 128,
+        d_conv: int = 4,
+        expand: int = 2,
+        headdim: int = 64,
+    ):
+        super().__init__()
+        Mamba2 = _require_mamba2()
+        d_inner = d_model * expand
+        if d_inner % headdim != 0:
+            # Pick a headdim that divides d_inner, preferring larger heads.
+            for cand in (64, 32, 16, 8):
+                if d_inner % cand == 0:
+                    headdim = cand
+                    break
+            else:
+                raise ValueError(
+                    f"d_model*expand={d_inner} not divisible by any supported headdim"
+                )
+        self.d_model = d_model
+        self.headdim = headdim
+        self.norm = nn.LayerNorm(d_model)
+        # Mamba2 already contains: in_proj, conv1d, SSD scan, out_proj, rmsnorm.
+        self.mamba2 = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Args: x (B, L, d_model). Returns (B, L, d_model)."""
+        residual = x
+        h = self.norm(x)
+        y = _mamba2_call(self.mamba2, h)
+        return residual + y
+
+
+@torch.compiler.disable
+def _mamba2_call(mamba2: nn.Module, h: Tensor) -> Tensor:
+    """Run Mamba2 under a torch.compiler.disable boundary so torch.compile
+    graph-breaks cleanly (Mamba2's SSD triton kernels can't be traced)."""
+    return mamba2(h)

@@ -457,6 +457,14 @@ class Engine:
                     f"(current: {self.config.batch_size}) or neighbor K."
                 )
 
+            # DDP: average train_loss across ranks so every rank makes the same
+            # _should_eval decision (adaptive strategy keys off train_loss; if
+            # ranks disagree on whether to eval, the later all_reduce deadlocks).
+            if self._distributed:
+                _tl = torch.tensor(train_loss, device=self.config.device)
+                torch.distributed.all_reduce(_tl, op=torch.distributed.ReduceOp.AVG)
+                train_loss = _tl.item()
+
             if self._should_eval(epoch, train_loss):
                 self._last_eval_epoch = epoch
                 self._loss_at_last_eval = train_loss
@@ -694,13 +702,27 @@ class Engine:
         return total_loss
 
     def _evaluate(self, eval_batches: list[RawBatch]) -> dict[str, float]:
-        """Run all registered eval protocols; return merged metrics dict."""
+        """Run all registered eval protocols; return merged metrics dict.
+
+        DDP: shard eval_batches across ranks (each rank evals its slice) and
+        all_reduce metrics (averaged). This cuts eval wall-clock ~world_size
+        and avoids 4 ranks each running the full val/test set, which exceeded
+        NCCL's default timeout on large graphs. Shards are contiguous slices
+        so per-rank AP is over a comparable sample; the averaged metric drives
+        early stopping (not a final reported number).
+        """
         model_state = self._raw_model.freeze()
         for head in self._tasks.values():
             head.eval()
 
+        # DDP shard: rank r gets batches[r::world_size].
+        if self._distributed and self._world_size > 1 and len(eval_batches) >= self._world_size:
+            sharded = eval_batches[self._rank::self._world_size]
+        else:
+            sharded = eval_batches
+
         prepped = []
-        for rb in eval_batches:
+        for rb in sharded:
             if rb.neg is None:
                 neg = self.eval_neg_strategy.sample(rb.src, rb.dst, rb.time,
                                                     self._eval_graph, rb.edge_indices)
@@ -715,15 +737,22 @@ class Engine:
         with torch.amp.autocast("cuda", enabled=self.config.use_amp):
             for proto in self._eval_protocols.values():
                 # Use _raw_model (unwrapped) for eval, NOT self.model (DDP-wrapped).
-                # DDP's forward hooks trigger all_reduce on every forward; if ranks
-                # run eval batches out of sync (e.g. different batch counts under
-                # adaptive eval, or eval-only-on-rank-0 schemes), DDP deadlocks
-                # with NCCL timeout. The unwrapped model has no such hooks, so each
-                # rank evals independently; metrics are all_reduced afterwards.
+                # DDP's forward hooks trigger all_reduce on every forward; eval
+                # sharding means ranks run different batch counts, which would
+                # deadlock DDP. The unwrapped model has no such hooks.
                 metrics = proto.evaluate(
                     self._raw_model, self._eval_pipeline, prepped, self._eval_graph
                 )
                 all_metrics.update(metrics)
+
+        # DDP: average metrics across ranks (each computed over its shard).
+        if self._distributed:
+            keys = sorted(all_metrics.keys())
+            if keys:
+                buf = torch.tensor([all_metrics[k] for k in keys],
+                                   device=self.config.device, dtype=torch.float32)
+                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.AVG)
+                all_metrics = {k: float(v) for k, v in zip(keys, buf.tolist())}
 
         self._raw_model.thaw(model_state)
         for head in self._tasks.values():

@@ -1,4 +1,4 @@
-"""Tests for modular Mamba blocks (MambaBlock, TimeAwareMambaBlock).
+"""Tests for modular Mamba blocks (MambaBlock, TimeAwareMambaBlock, Mamba2Block).
 
 Requires mamba_ssm + CUDA. Skipped when mamba_ssm can't import.
 """
@@ -9,7 +9,7 @@ pytest.importorskip("mamba_ssm")
 
 import torch
 
-from tgengine.nn.mamba_block import MambaBlock, TimeAwareMambaBlock
+from tgengine.nn.mamba_block import Mamba2Block, MambaBlock, TimeAwareMambaBlock
 
 
 def _cuda():
@@ -161,3 +161,68 @@ def test_timeaware_block_long_dt_increases_forgetting():
     # (Directional: this is the intended A(dt) semantics.)
     assert influence_huge <= influence_small + 1e-3, \
         f"expected long-dt forgetting, got small={influence_small} huge={influence_huge}"
+
+
+# ---------------------------------------------------------------------------
+# Mamba2Block (SSD)
+# ---------------------------------------------------------------------------
+
+def test_mamba2_block_output_shape():
+    dev = _cuda()
+    blk = Mamba2Block(d_model=64, d_state=64).to(dev)
+    x = torch.randn(4, 10, 64, device=dev)
+    out = blk(x)
+    assert out.shape == (4, 10, 64)
+
+
+def test_mamba2_block_residual_finite():
+    dev = _cuda()
+    blk = Mamba2Block(d_model=64, d_state=64).to(dev)
+    blk.eval()
+    x = torch.randn(2, 8, 64, device=dev)
+    out = blk(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
+def test_mamba2_block_backward():
+    dev = _cuda()
+    blk = Mamba2Block(d_model=64, d_state=64).to(dev)
+    x = torch.randn(2, 8, 64, device=dev, requires_grad=True)
+    out = blk(x)
+    out.sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    # Mamba2 internal params get grad
+    has_grad = any(p.grad is not None and torch.isfinite(p.grad).all()
+                   for p in blk.mamba2.parameters())
+    assert has_grad
+
+
+def test_mamba2_block_headdim_auto_pick():
+    """Small d_model where default headdim=64 doesn't divide d_inner should
+    auto-pick a smaller headdim instead of crashing."""
+    dev = _cuda()
+    # d_model=32, expand=2 → d_inner=64, headdim=64 OK (1 head)
+    # d_model=24, expand=2 → d_inner=48, 48%64!=0 → auto-pick headdim=16 (3 heads)
+    blk = Mamba2Block(d_model=24, d_state=32, expand=2).to(dev)
+    assert blk.headdim in (16, 8)  # auto-picked down from 64
+    x = torch.randn(2, 8, 24, device=dev)
+    out = blk(x)
+    assert out.shape == (2, 8, 24)
+
+
+def test_mamba2_block_runs_under_compile():
+    """Mamba2Block must work under torch.compile (graph-breaks at _mamba2_call)."""
+    dev = _cuda()
+    blk = Mamba2Block(d_model=64, d_state=64).to(dev)
+    blk.eval()
+    x = torch.randn(2, 8, 64, device=dev)
+    with torch.no_grad():
+        y_eager = blk(x)
+    blk_c = torch.compile(blk)
+    blk_c.eval()
+    with torch.no_grad():
+        y_compiled = blk_c(x)
+    assert torch.allclose(y_eager, y_compiled, atol=1e-3), \
+        f"Mamba2Block compile diverged: max diff {(y_eager-y_compiled).abs().max()}"
