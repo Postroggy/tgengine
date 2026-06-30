@@ -12,6 +12,7 @@ __all__ = ["DyGFormer", "FreeDyG", "GraphMixer", "ModelOutput", "TGN", "Temporal
 try:
     from .crossmamba import CrossMamba
     from .dygmamba import DyGMamba
-    __all__ += ["CrossMamba", "DyGMamba"]
+    from .foundation import FoundationModel
+    __all__ += ["CrossMamba", "DyGMamba", "FoundationModel"]
 except ImportError:
     pass
