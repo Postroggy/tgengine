@@ -193,6 +193,7 @@ class MixedDataset:
         device: str = "cpu",
         balance: bool = False,
         per_domain_cap: Optional[int] = None,
+        mode: str = "balanced",
     ):
         """Return list of RawBatch for the given split.
 
@@ -200,11 +201,19 @@ class MixedDataset:
             split: "train", "val", or "test"
             batch_size: edges per batch
             device: target device
-            balance: if True (train only), use round-robin across domains with
-                equal per-domain edge count. Prevents large domains from dominating.
+            balance: if True (train only), use domain-aware mixing.
                 Ignored for val/test.
-            per_domain_cap: max edges per domain for balanced training.
+            per_domain_cap: max edges per domain for balanced mode.
                 Defaults to min(train_size across domains).
+            mode: mixing strategy when balance=True:
+                - "balanced": round-robin, each domain capped at
+                  per_domain_cap (equal samples per domain). Simple but
+                  wastes large datasets' data.
+                - "proportional": each domain contributes edges
+                  proportional to its train size (no cap). Domains
+                  stay in chronological order within their slices;
+                  slices are interleaved proportionally. Preserves all
+                  training data.
         """
         from tgengine.core.batch import RawBatch
 
@@ -233,7 +242,49 @@ class MixedDataset:
                 batches.append(RawBatch(src=src[s], dst=dst[s], time=time[s], edge_feat=feat[s]))
             return batches
 
-        # --- Balanced round-robin training batches ---
+        # --- Balanced or proportional mixing ---
+        if mode == "proportional":
+            # Each domain contributes ALL its training edges, interleaved
+            # proportionally. No cap — preserves all data.
+            domain_batches: List[List] = []
+            for info, src_ds, dst_ds, time_ds, feat_ds in zip(
+                self._infos,
+                self._per_ds_src, self._per_ds_dst,
+                self._per_ds_time, self._per_ds_feat,
+            ):
+                end = info.train_end
+                src = src_ds[:end].to(device)
+                dst = dst_ds[:end].to(device)
+                t = time_ds[:end].to(device)
+                feat = feat_ds[:end].to(device)
+
+                ds_batches = []
+                for i in range(0, end, batch_size):
+                    s = slice(i, i + batch_size)
+                    ds_batches.append(RawBatch(src=src[s], dst=dst[s], time=t[s], edge_feat=feat[s]))
+                domain_batches.append(ds_batches)
+
+            # Interleave proportionally: step through each domain at a rate
+            # proportional to its size. E.g. if enron has 3x more edges than
+            # BA, enron contributes 3 batches for every 1 from BA.
+            total = sum(info.train_end for info in self._infos)
+            batches = []
+            # Use a ratio-based round-robin: track progress per domain
+            progress = [0.0] * len(domain_batches)
+            sizes = [info.train_end for info in self._infos]
+            idx = [0] * len(domain_batches)
+            steps = total // batch_size + 1
+            for _ in range(steps):
+                for d, db in enumerate(domain_batches):
+                    # Advance domain d if its proportional progress allows
+                    target = (sum(progress) + 1) * sizes[d] / total
+                    if progress[d] < target and idx[d] < len(db):
+                        batches.append(db[idx[d]])
+                        progress[d] += 1
+                        idx[d] += 1
+            return batches
+
+        # --- Balanced round-robin (original, with cap) ---
         # Each domain contributes exactly `cap` edges (first cap chronologically)
         cap = per_domain_cap or min(info.train_end for info in self._infos)
 
