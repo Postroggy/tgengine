@@ -1,23 +1,25 @@
-"""Foundation model pretraining: Phase 2a (MTM + NTP) and Phase 2b (+ LP BCE).
+"""Foundation model pretraining via the TGEngine (not a custom loop).
 
-Trains the FoundationModel on a MixedDataset with three pretraining tasks:
-  - MTM (Masked Token Modeling): reconstruct masked token features
-  - NTP (Next Time Prediction): predict next-event time encoding
-  - LP BCE (Link Prediction): standard link prediction loss
+Uses the Engine's standard train loop so we get for free:
+  - DDP multi-GPU (rank-0-only eval, gradient sync, barrier)
+  - AMP mixed precision (Mamba conv1d/ssm wrapped in autocast=False)
+  - async prefetch pipeline
+  - grad clip, LR scheduler, checkpointing
+  - APEval / ThreeWayEval protocols
 
-Architecture: d_model=512, K=64, 10 Mamba + 2 GCA, ~19M params.
+The FoundationModel.forward() returns the 3-task pretraining loss
+(MTM+NTP+LP) when pretrain_mode=True, so the Engine drives pretraining
+through its normal _step() → model(prepared) → ModelOutput path.
 
-Usage (glibc239 fast-path):
-    MAMBA_PYTHON=<mamba2>/python3.11 scripts/run_mamba.sh python \
-        examples/train_foundation.py \
+Usage (single GPU):
+    scripts/run_mamba.sh python examples/train_foundation.py \
         --datasets enron BitcoinAlpha uci \
-        --epochs 20 --K 64 --d_model 512 --d_state 64 \
-        --lr 1e-3 --batch_size 200
+        --epochs 20 --K 64 --d_model 512
 
-Phase 2a (self-supervised only, no LP):
-    --phase 2a
-Phase 2b (all three tasks):
-    --phase 2b  (default)
+Usage (4-GPU DDP):
+    CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_mamba.sh python -m torch.distributed.run \
+        --nproc_per_node=4 examples/train_foundation.py \
+        --datasets enron BitcoinAlpha uci --epochs 20 --distributed
 """
 import argparse
 import sys
@@ -25,7 +27,6 @@ import os
 import time
 
 import torch
-import torch.nn as nn
 
 # Make benchmarks/ablation importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "benchmarks", "ablation"))
@@ -39,28 +40,48 @@ def main():
     p.add_argument("--batch_size", type=int, default=200)
     p.add_argument("--K", type=int, default=64)
     p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--d_state", type=int, default=64)
+    p.add_argument("--d_state", type=int, default=32)
     p.add_argument("--d_time", type=int, default=64)
-    p.add_argument("--n_mamba_layers", type=int, default=10)
-    p.add_argument("--gca_every", type=int, default=5)
+    p.add_argument("--n_mamba_layers", type=int, default=8)
+    p.add_argument("--gca_every", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--use_amp", action="store_true", default=False)
+    p.add_argument("--async_pipeline", action="store_true", default=False)
+    # Pretraining task weights
+    p.add_argument("--w_mtm", type=float, default=1.0)
+    p.add_argument("--w_ntp", type=float, default=1.0)
+    p.add_argument("--w_lp", type=float, default=1.0)
     p.add_argument("--mtm_mask_ratio", type=float, default=0.15)
     p.add_argument("--mtm_block_size", type=int, default=4)
     p.add_argument("--ema_momentum", type=float, default=0.999)
-    p.add_argument("--phase", choices=["2a", "2b"], default="2b",
-                   help="2a: MTM+NTP only, 2b: MTM+NTP+LP (default)")
-    p.add_argument("--amp", action="store_true", default=True,
-                   help="Enable mixed precision (default True)")
-    p.add_argument("--no_amp", dest="amp", action="store_false")
+    # DDP
+    p.add_argument("--distributed", action="store_true",
+                   help="Enable DDP (use with torch.distributed.run)")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
+
+    # --- DDP setup (if launched via torchrun) ---
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    dist_avail = torch.distributed.is_available() and world_size > 1
+    if dist_avail and not torch.distributed.is_initialized():
+        import datetime
+        torch.distributed.init_process_group(
+            backend="nccl",
+            device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=datetime.timedelta(minutes=120),
+        )
+    if dist_avail:
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = args.device
 
     from tgengine.core.dataset import load_dataset
     from tgengine.core.mixed_dataset import MixedDataset
     from tgengine.core.temporal_graph import TemporalGraph
-    from tgengine.core.batch import RawBatch
-    from tgengine.pipeline import DataPipeline
+    from tgengine.engine import APEval, Engine, TrainConfig
     from tgengine.pipeline.negatives import RandomNegative
     from tgengine.models.foundation import FoundationModel
     from tgengine.utils import seed_everything
@@ -74,36 +95,16 @@ def main():
         ds = load_dataset(name, args.data_root)
         ds_list.append(ds)
         names.append(name)
-        print(f"  [{name:15s}]  {ds.num_nodes:6d} nodes  {ds.num_edges:7d} edges  "
-              f"d_edge={ds.edge_feat_dim}", flush=True)
+        if local_rank == 0:
+            print(f"  [{name:15s}]  {ds.num_nodes:6d} nodes  {ds.num_edges:7d} edges  "
+                  f"d_edge={ds.edge_feat_dim}", flush=True)
 
     mixed = MixedDataset(ds_list, names=names)
-    print(mixed.summary(), flush=True)
+    if local_rank == 0:
+        print(mixed.summary(), flush=True)
 
-    # --- Build graph ---
-    graph = mixed.make_graph(buffer_size=args.K, device=args.device)
-
-    # --- Build batches (before preloading, since preload iterates them) ---
-    train_batches = mixed.get_batches(
-        "train", batch_size=args.batch_size, balance=True, device=args.device,
-    )
-    val_batches = mixed.get_batches(
-        "val", batch_size=args.batch_size, device=args.device,
-    )
-    print(f"Batches: train={len(train_batches)} (balanced)  val={len(val_batches)}",
-          flush=True)
-
-    # Preload all training edges into the graph (CSR build phase).
-    # The TemporalGraph starts empty; without preloading, neighbor queries
-    # return all-padding (mask=False), producing zero losses. This mirrors
-    # what the Engine does at init: static graph during training.
-    print("Preloading training edges into graph...", flush=True)
-    t0 = time.time()
-    for rb in train_batches:
-        graph.advance(rb.src, rb.dst, rb.time, rb.edge_feat)
-    graph.freeze_csr()
-    print(f"  CSR frozen with {graph.num_edges:,} edges in {time.time()-t0:.1f}s",
-          flush=True)
+    # --- Build graph (Engine preloads train edges at init) ---
+    graph = mixed.make_graph(buffer_size=args.K, device=device)
 
     # --- Build model ---
     model = FoundationModel(
@@ -114,197 +115,81 @@ def main():
         d_time=args.d_time,
         n_mamba_layers=args.n_mamba_layers,
         gca_every=args.gca_every,
-    ).to(args.device)
+        pretrain_mode=True,
+        task_weights={"mtm": args.w_mtm, "ntp": args.w_ntp, "lp": args.w_lp},
+        mtm_mask_ratio=args.mtm_mask_ratio,
+        mtm_block_size=args.mtm_block_size,
+    ).to(device)
     model.init_ema(momentum=args.ema_momentum)
 
     n_params = sum(p.numel() for p in model.parameters())
     mamba_count = sum(1 for b in model.blocks if hasattr(b, "ssm"))
     gca_count = sum(1 for b in model.blocks if hasattr(b, "q_proj"))
-    print(f"Model: {n_params:,} params  "
-          f"{mamba_count} Mamba + {gca_count} GCA = {len(model.blocks)} blocks  "
-          f"K={args.K}  d={args.d_model}  phase={args.phase}", flush=True)
+    if local_rank == 0:
+        print(f"Model: {n_params:,} params  "
+              f"{mamba_count} Mamba + {gca_count} GCA = {len(model.blocks)} blocks  "
+              f"K={args.K}  d={args.d_model}  "
+              f"weights(mtms={args.w_mtm},ntp={args.w_ntp},lp={args.w_lp})", flush=True)
 
-    # --- Build pipeline (for neighbor sampling during training) ---
-    pipeline = DataPipeline(model.gather_spec, graph)
+    # --- Batches ---
+    train_batches = mixed.get_batches(
+        "train", batch_size=args.batch_size, balance=True, device=device,
+    )
+    val_batches = mixed.get_batches(
+        "val", batch_size=args.batch_size, device=device,
+    )
+    test_batches = mixed.get_batches(
+        "test", batch_size=args.batch_size, device=device,
+    )
+    if local_rank == 0:
+        print(f"Batches: train={len(train_batches)} (balanced)  "
+              f"val={len(val_batches)}  test={len(test_batches)}", flush=True)
+
+    # --- Engine config ---
     neg = RandomNegative(mixed.num_nodes)
+    cfg = TrainConfig(
+        epochs=args.epochs, lr=args.lr, device=device,
+        patience=args.epochs + 5,  # no early stopping for pretraining
+        grad_clip=args.grad_clip,
+        use_amp=args.use_amp,
+        async_pipeline=args.async_pipeline,
+        distributed=dist_avail,
+        eval_strategy="every_n", eval_every=5,
+    )
 
-    # --- Optimizer + AMP scaler ---
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    engine = Engine(
+        model, graph, train_batches, val_batches, test_batches,
+        neg_strategy=neg, eval_protocol=APEval(), config=cfg,
+    )
 
-    # --- Training loop ---
-    print(f"\n{'='*60}", flush=True)
-    print(f"  Pretraining Phase {args.phase}  ({'+'.join(names)})  "
-          f"amp={args.amp}", flush=True)
-    print(f"  {'='*60}", flush=True)
+    if local_rank == 0:
+        print(f"\n{'='*60}", flush=True)
+        print(f"  Foundation pretraining via Engine  ({'+'.join(names)})", flush=True)
+        print(f"  distributed={dist_avail}  amp={args.use_amp}  "
+              f"async={args.async_pipeline}", flush=True)
+        print(f"{'='*60}", flush=True)
 
-    best_val_ap = 0.0
-    best_state = None
+    # --- Train via Engine ---
+    t0 = time.time()
+    result = engine.train()
+    dt = time.time() - t0
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        t0 = time.time()
+    if local_rank == 0:
+        print(f"\n{'='*60}", flush=True)
+        print(f"  Engine pretraining complete in {dt:.1f}s", flush=True)
+        print(f"  Test metrics (merged): {result}", flush=True)
+        print(f"{'='*60}", flush=True)
 
-        total_mtm = 0.0
-        total_ntp = 0.0
-        total_lp = 0.0
-        n_steps = 0
-
-        for rb in train_batches:
-            # Sample negatives
-            neg_ids = neg.sample(rb.src, rb.dst, rb.time, graph, rb.edge_indices)
-            rb.neg = neg_ids
-
-            # Prepare batch (neighbor sampling via pipeline)
-            batch = pipeline.prepare(rb)
-
-            # Forward under autocast for mixed precision
-            with torch.amp.autocast("cuda", enabled=args.amp):
-                result = model.pretrain_forward(
-                    batch,
-                    mtm_mask_ratio=args.mtm_mask_ratio,
-                    mtm_block_size=args.mtm_block_size,
-                )
-                if args.phase == "2a":
-                    loss = result["mtm_loss"] + result["ntp_loss"]
-                else:
-                    loss = result["loss"]
-
-            # Backward
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-
-            # Update EMA
-            model.update_ema()
-
-            total_mtm += result["mtm_loss"].item()
-            total_ntp += result["ntp_loss"].item()
-            total_lp += result["lp_loss"].item()
-            n_steps += 1
-
-        dt = time.time() - t0
-        avg_mtm = total_mtm / max(n_steps, 1)
-        avg_ntp = total_ntp / max(n_steps, 1)
-        avg_lp = total_lp / max(n_steps, 1)
-
-        print(f"  Epoch {epoch:3d}: mtm={avg_mtm:.4f}  ntp={avg_ntp:.4f}  "
-              f"lp={avg_lp:.4f}  {dt:.1f}s  "
-              f"mem={torch.cuda.max_memory_allocated()/1e9:.1f}GB", flush=True)
-
-        # --- Eval every 5 epochs ---
-        if epoch % 5 == 0 or epoch == args.epochs:
-            val_ap = eval_per_domain(model, mixed, ds_list, args)
-            print(f"    val AP (per-domain): {val_ap}", flush=True)
-
-            # Track best (average per-domain AP)
-            avg_ap = sum(val_ap.values()) / max(len(val_ap), 1)
-            if avg_ap > best_val_ap:
-                best_val_ap = avg_ap
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    # --- Summary ---
-    print(f"\n{'='*60}", flush=True)
-    print(f"  Phase {args.phase} complete  best avg per-domain AP={best_val_ap:.4f}",
-          flush=True)
-    print(f"{'='*60}", flush=True)
-
-    # Save best model
-    if best_state is not None:
-        save_path = f"checkpoints/foundation_phase{args.phase}.pt"
+        # Save best model (Engine tracks best_val, but for pretraining we
+        # save the final state — the Engine's checkpoint logic saves to
+        # config.checkpoint_dir if set)
+        save_path = "checkpoints/foundation_engine.pt"
         os.makedirs("checkpoints", exist_ok=True)
-        torch.save(best_state, save_path)
-        print(f"  Saved best model to {save_path}", flush=True)
+        torch.save(model.state_dict(), save_path)
+        print(f"  Saved final model to {save_path}", flush=True)
 
-
-def eval_per_domain(model, mixed, ds_list, args):
-    """Evaluate on each domain separately with in-domain negatives."""
-    from tgengine.core.temporal_graph import TemporalGraph
-    from tgengine.core.batch import RawBatch
-    from tgengine.pipeline import DataPipeline
-    from tgengine.pipeline.negatives import RandomNegative
-    from tgengine.engine import APEval
-
-    model.eval()
-    results = {}
-
-    for info, ds in zip(mixed._infos, ds_list):
-        offset = info.node_offset
-        total_nodes = offset + info.num_nodes
-
-        # Build per-domain eval graph
-        eval_graph = TemporalGraph(
-            total_nodes, edge_feat_dim=ds.edge_feat_dim,
-            buffer_size=args.K, device=args.device,
-        )
-
-        # Normalize timestamps (same as MixedDataset)
-        t_all = ds.time.cpu().float()
-        t_min, t_max = float(t_all.min()), float(t_all.max())
-        t_norm = ((t_all - t_min) / (t_max - t_min) if t_max > t_min
-                  else torch.zeros_like(t_all)).to(args.device)
-
-        n = len(t_norm)
-        train_end = int(n * 0.70)
-        val_end = int(n * 0.85)
-
-        # Load all edges into eval graph
-        src_all = ds.src.to(args.device) + offset
-        dst_all = ds.dst.to(args.device) + offset
-        feat_all = ds.edge_feat.to(args.device) if ds.edge_feat is not None else None
-        eval_graph.advance(src_all, dst_all, t_norm, feat_all)
-        eval_graph.freeze_csr()
-
-        # Pipeline for this domain's eval graph
-        eval_pipeline = DataPipeline(model.gather_spec, eval_graph)
-
-        # Per-domain neg sampler
-        domain_neg = RandomNegative(info.num_nodes)
-
-        # Build val batches
-        val_src = src_all[train_end:val_end]
-        val_dst = dst_all[train_end:val_end]
-        val_t = t_norm[train_end:val_end]
-        val_feat = feat_all[train_end:val_end] if feat_all is not None else None
-
-        prepped = []
-        bs = args.batch_size
-        for i in range(0, len(val_src), bs):
-            s = slice(i, i + bs)
-            src_b, dst_b, t_b = val_src[s], val_dst[s], val_t[s]
-            feat_b = val_feat[s] if val_feat is not None else None
-            n_b = domain_neg.sample(
-                src_b - offset, dst_b - offset, t_b, eval_graph, None,
-            ) + offset
-            rb = RawBatch(src=src_b, dst=dst_b, time=t_b, edge_feat=feat_b, neg=n_b)
-            prepped.append(eval_pipeline.prepare(rb))
-
-        # Run LP eval (using the model's standard forward for scoring)
-        protocol = APEval()
-        with torch.no_grad():
-            all_pos, all_neg = [], []
-            for batch in prepped:
-                bundle = model.encode(batch)
-                pos = (bundle.src * bundle.dst).sum(-1)
-                neg_s = (bundle.src * bundle.neg).sum(-1)
-                all_pos.append(pos)
-                all_neg.append(neg_s)
-            pos_cat = torch.cat(all_pos).sigmoid().cpu().numpy()
-            neg_cat = torch.cat(all_neg).sigmoid().cpu().numpy()
-            import numpy as np
-            from sklearn.metrics import average_precision_score
-            predicts = np.concatenate([pos_cat, neg_cat])
-            labels = np.concatenate([np.ones(len(pos_cat)), np.zeros(len(neg_cat))])
-            ap = average_precision_score(labels, predicts)
-
-        results[info.name] = ap
-
-    model.train()
-    return results
+    if dist_avail:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

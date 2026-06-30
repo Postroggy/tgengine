@@ -53,6 +53,12 @@ class FoundationModel(TemporalModel):
         n_gca_heads: attention heads in GCA (default 4)
         gca_ff_mult: GCA feedforward multiplier (default 2)
         mtm_target_dim: reconstruction target dim (d_edge + d_pair)
+        pretrain_mode: if True, forward() returns the 3-task pretraining
+            loss (MTM+NTP+LP). If False, returns LP BCE only (standard).
+        task_weights: dict of loss weights for {'mtm','ntp','lp'} when in
+            pretrain mode. Defaults to all 1.0.
+        mtm_mask_ratio: fraction of positions to mask for MTM (default 0.15)
+        mtm_block_size: block size for MTM masking (default 4)
     """
 
     def __init__(
@@ -69,12 +75,20 @@ class FoundationModel(TemporalModel):
         n_gca_heads: int = 4,
         gca_ff_mult: int = 2,
         mtm_target_dim: int = 174,  # d_edge(172) + d_pair(2)
+        pretrain_mode: bool = False,
+        task_weights: Optional[dict] = None,
+        mtm_mask_ratio: float = 0.15,
+        mtm_block_size: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
         self.K = K
         self.d_time = d_time
         self.mtm_target_dim = mtm_target_dim
+        self.pretrain_mode = pretrain_mode
+        self.task_weights = task_weights or {"mtm": 1.0, "ntp": 1.0, "lp": 1.0}
+        self.mtm_mask_ratio = mtm_mask_ratio
+        self.mtm_block_size = mtm_block_size
 
         # GatherSpec: K neighbors for src, dst, neg
         self.gather_spec = GatherSpec(
@@ -204,19 +218,47 @@ class FoundationModel(TemporalModel):
         return EmbeddingBundle(src=src_vec, dst=dst_vec, neg=neg_vec)
 
     def forward(self, batch: PreparedBatch) -> ModelOutput:
-        """Standard forward: LP BCE loss via Engine compatibility."""
-        bundle = self.encode(batch)
-        return self._link_pred_loss(bundle)
+        """Engine-compatible forward.
+
+        If pretrain_mode=True AND training: returns the 3-task pretraining
+            loss (MTM + NTP + LP) so the Engine's standard train loop drives
+            pretraining. The Engine's DDP/AMP/async/checkpoint all apply.
+        Otherwise (eval, or pretrain_mode=False): returns standard LP BCE
+            loss only — eval protocols (APEval) need pos_score/neg_score.
+        """
+        if not self.pretrain_mode or not self.training:
+            bundle = self.encode(batch)
+            return self._link_pred_loss(bundle)
+        return self._pretrain_loss(batch)
+
+    def evolve(self, src, dst, time, edge_feat=None):
+        """Engine calls this after each batch. Update EMA encoder here."""
+        self.update_ema()
 
     # ------------------------------------------------------------------
     # Pretraining forward (all 3 tasks)
     # ------------------------------------------------------------------
 
+    def _pretrain_loss(self, batch: PreparedBatch) -> ModelOutput:
+        """Compute 3-task pretraining loss and return as ModelOutput.
+
+        This is the Engine-compatible entry point: forward() calls this
+        when pretrain_mode=True. The returned ModelOutput.loss is the
+        weighted sum of MTM + NTP + LP, so the Engine's optimizer can
+        step on it directly.
+        """
+        result = self.pretrain_forward(batch)
+        return ModelOutput(
+            loss=result["loss"],
+            pos_score=result["pos_score"],
+            neg_score=result["neg_score"],
+        )
+
     def pretrain_forward(
         self,
         batch: PreparedBatch,
-        mtm_mask_ratio: float = 0.15,
-        mtm_block_size: int = 4,
+        mtm_mask_ratio: Optional[float] = None,
+        mtm_block_size: Optional[int] = None,
     ) -> dict[str, Tensor]:
         """Pretraining forward pass: compute MTM + NTP + LP losses.
 
@@ -231,6 +273,10 @@ class FoundationModel(TemporalModel):
         """
         device = batch.src.device
         K = self.K
+        # Use instance defaults if not overridden
+        mtm_mask_ratio = mtm_mask_ratio if mtm_mask_ratio is not None else self.mtm_mask_ratio
+        mtm_block_size = mtm_block_size if mtm_block_size is not None else self.mtm_block_size
+        w = self.task_weights
 
         # --- Generate MTM mask (same for all three encodings in a batch) ---
         mtm_mask = block_wise_mask(
@@ -297,8 +343,12 @@ class FoundationModel(TemporalModel):
             + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
         )
 
-        # === Total loss ===
-        total_loss = mtm_loss + ntp_loss + lp_loss
+        # === Total loss (weighted by task_weights) ===
+        total_loss = (
+            w.get("mtm", 1.0) * mtm_loss
+            + w.get("ntp", 1.0) * ntp_loss
+            + w.get("lp", 1.0) * lp_loss
+        )
 
         return {
             "loss": total_loss,

@@ -200,15 +200,20 @@ class TimeAwareMambaBlock(MambaBlock):
         h = self.norm(x)
         xz = self.in_proj(h)
         x_branch, z = xz.chunk(2, dim=-1)
-        x_branch = self.conv1d(x_branch.transpose(1, 2))[:, :, :residual.shape[1]]
-        x_branch = F.silu(x_branch.transpose(1, 2))
+        # Conv1d + selective_scan must run in fp32: under AMP autocast
+        # they hit cuDNN CUDNN_STATUS_NOT_INITIALIZED (the CUDA kernel
+        # requires fp32 inputs). Disable autocast for these ops only;
+        # the surrounding projections still run in fp16 under AMP.
+        with torch.amp.autocast("cuda", enabled=False):
+            x_branch = self.conv1d(x_branch.float().transpose(1, 2))[:, :, :residual.shape[1]]
+            x_branch = F.silu(x_branch.transpose(1, 2))
 
-        extra_delta = None
-        if dt is not None:
-            # (B, L) -> (B, L, d_inner)
-            extra_delta = self.dt_time_proj(dt.float().unsqueeze(-1))
+            extra_delta = None
+            if dt is not None:
+                # (B, L) -> (B, L, d_inner)
+                extra_delta = self.dt_time_proj(dt.float().unsqueeze(-1))
 
-        y = self.ssm(x_branch, delta_bias=self.ssm._dt_bias(), extra_delta=extra_delta) * F.silu(z)
+            y = self.ssm(x_branch, delta_bias=self.ssm._dt_bias(), extra_delta=extra_delta) * F.silu(z)
         return residual + self.out_proj(y)
 
 
