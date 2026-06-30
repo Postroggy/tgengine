@@ -32,6 +32,11 @@
 #### GPT-GNN（KDD 2020）— 图上的自回归生成
 - **目标**：自回归式地生成节点属性 + 边
 - **方法**：将图转为序列（通过节点排序），逐个生成节点及其连接
+- **自回归分解**：
+
+$$p_\theta(\mathbf{S}^\pi) = \prod_{i=1}^{n} p_\theta\!\left(\mathbf{S}_i^\pi \mid \mathbf{S}_{<i}^\pi\right)$$
+
+  其中 $\pi$ 为节点排列，$\mathbf{S}_i^\pi$ 编码节点 $\pi(v_i)$ 与前序节点的连接。
 - **Loss**：属性重建 MSE + 边预测 CE
 - **启示**：图可以当作序列做自回归，但需要节点排序方案
 
@@ -39,6 +44,11 @@
 - **目标**：mask 节点特征，重建被 mask 的特征（不重建结构）
 - **关键创新**：
   1. **Scaled Cosine Error**（不用 MSE）：解决图特征向量范数差异大 + 维度灾难问题
+
+$$\mathcal{L}_{\text{SCE}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \left(1 - \frac{\hat{\mathbf{x}}_i^\top \mathbf{x}_i}{\|\hat{\mathbf{x}}_i\| \cdot \|\mathbf{x}_i\|}\right)^\gamma, \quad \gamma \geq 1$$
+
+  其中 $\mathcal{M}$ 为 mask 集合，$\mathbf{x}_i$ 为真值特征，$\hat{\mathbf{x}}_i$ 为重建特征，$\gamma$ 控制难易样本权重。
+
   2. **Re-mask decoding**：decoder 前再次 mask encoder 输出，防止信息泄漏
   3. **GNN decoder**（不用 MLP）：更强的 decoder 弥补 encoder-目标 gap
 - **启示**：图特征重建用 cosine error 比 MSE 稳定；mask 策略需要防止信息泄漏
@@ -46,10 +56,19 @@
 #### GraphCL（NeurIPS 2020）— 对比学习
 - **目标**：图增强 → InfoNCE 对比不同 view
 - **增强方式**：节点丢弃、边扰动、子图采样
+- **Loss**：InfoNCE
+
+$$\mathcal{L}_{\text{InfoNCE}} = -\sum_{i=1}^{N} \log \frac{\exp\!\left(\text{sim}(f(x_i),\, f(x_i^+)) / \tau\right)}{\sum_{j=1}^{N} \exp\!\left(\text{sim}(f(x_i),\, f(x_j^-)) / \tau\right)}$$
+
+  其中 $x_i^+$ 为正样本（同一实例的增强 view），$x_j^-$ 为负样本，$\tau$ 为温度系数。
 - **启示**：对比学习对增强方式敏感，图增强的"label-invariance"难以保证
 
 #### AnyGraph（2024）— MoE + 链接预测
 - **目标**：链接预测（softmax over all nodes + negative sampling）
+
+$$\mathcal{L}_{\text{AnyGraph}} = \sum_{b \in B} -\frac{1}{B} \log \frac{\exp(\hat{y}_{c_b, p_b} - \hat{y}_{\max})}{\sum_{v_n \in \mathcal{V}} \exp(\hat{y}_{c_b, n} - \hat{y}_{\max})}$$
+
+  其中 $(v_{c_b}, v_{p_b})$ 为正样本边，$\hat{y}_{\max}$ 为 batch 内最大预测分（数值稳定）。
 - **跨域处理**：
   1. **特征统一化**：SVD + simplified GCN 将不同图的特征映射到统一 embedding 空间
   2. **MoE 路由**：不同专家处理不同域的子图，基于自监督 loss 自动路由
@@ -103,6 +122,10 @@
 - **Tokenization**：连续值 → mean scaling → uniform quantization → 离散 token（分 bin）
 - **目标**：Next-token prediction（和 GPT 完全一样）
 - **Loss**：Cross-entropy over quantized bins
+
+$$\mathcal{L}_{\text{Chronos}} = -\sum_{t=1}^{T} \log p_\theta\!\left(q(x_t) \mid q(x_{<t})\right)$$
+
+  其中 $q: \mathbb{R} \to \{1, 2, \dots, B\}$ 是量化函数，$B$ 为 bin 数。
 - **核心洞察**："回归通过分类实现" — 把连续值预测转为分类问题
 - **数据增强**：TSMix（多时序凸组合）+ KernelSynth（高斯过程生成合成时序）
 - **启示**：连续值可以量化为离散 token，直接复用 LLM 架构和训练范式
@@ -135,7 +158,11 @@
   - ❌ Multi-patch input → ✅ **Single patch size**
   - ❌ Mixture distribution → ✅ **Quantile loss (pinball loss)**
   - ✅ 新增 **Multi-token prediction**（每个输出 token 预测多个未来 patch）
-- **Loss**：Quantile loss（9 个分位数 0.1-0.9）
+- **Loss**：Quantile loss（9 个分位数 $q \in \{0.1, 0.2, \dots, 0.9\}$，即 pinball loss）
+
+$$\mathcal{L}_{\text{Moirai-2}} = \frac{1}{H \cdot |Q|} \sum_{t=1}^{H} \sum_{q \in Q} \left[ q \cdot \max(y_t - \hat{y}_t^{(q)},\, 0) + (1-q) \cdot \max(\hat{y}_t^{(q)} - y_t,\, 0) \right]$$
+
+  其中 $H = K \cdot p$ 为预测长度（$K$ 个 patch，每个 patch size $p$），$y_t$ 为真值，$\hat{y}_t^{(q)}$ 为第 $q$ 分位数预测。
 - **结果**：比 Moirai 1.0-Large **快 2x、小 30x、性能更好**
 - **关键洞察**：
   > "decoder-only backbone along with recursive multi-quantile decoding contribute most to the gains"
@@ -169,6 +196,16 @@
 | **GPT 系列** | Decoder-only | Next-token prediction（自回归） | Cross-entropy |
 | **BERT** | Encoder-only | Masked Language Model（mask 15%） | Cross-entropy |
 | **T5/BART** | Encoder-Decoder | Denoising seq2seq（corrupt→reconstruct） | Cross-entropy |
+
+**GPT next-token prediction**：
+
+$$\mathcal{L}_{\text{GPT}} = -\sum_{t=1}^{T} \log p_\theta(w_t \mid w_{<t})$$
+
+**BERT Masked Language Model**：
+
+$$\mathcal{L}_{\text{BERT}} = -\sum_{t \in \mathcal{M}} \log p_\theta(w_t \mid w_{\setminus \mathcal{M}})$$
+
+其中 $\mathcal{M}$ 为 mask 集合，$w_{\setminus \mathcal{M}}$ 为未 mask 的上下文。
 
 **LLM 的核心教训**：
 1. **目标越简单越好**：next-token prediction 一个目标就够 scaling
@@ -257,31 +294,54 @@ CTDG 和上述三大范式的关键区别：
 
 基于调研，推荐**多任务生成式预训练**（融合 GPT-GNN + Chronos + GraphMAE）：
 
-```
-Task 1: Masked Temporal Reconstruction (from Chronos/Moirai 2.0)
-  - mask 邻居序列中 15% 的 Δt
-  - 量化为 bin（Chronos 式）或直接 quantile loss（Moirai 2.0 式）
-  - → 迫使模型理解时序因果结构
+**总损失函数**：
 
-Task 2: Link Prediction (from AnyGraph/MiNT)
-  - score(src, dst) vs score(src, neg)
-  - BCE loss，直接对齐 eval
-  - → 主信号，保证 pretrain→eval gap 小
+$$\mathcal{L}_{\text{total}} = \alpha \cdot \mathcal{L}_{\text{temporal}} + \beta \cdot \mathcal{L}_{\text{link}} + \gamma \cdot \mathcal{L}_{\text{edge\_feat}}$$
 
-Task 3: Edge Feature Reconstruction (from GraphMAE)
-  - mask edge_feat → 重建
-  - Scaled cosine error（不用 MSE）
-  - → 迫使模型理解交互属性
+**Task 1: Masked Temporal Reconstruction**（from Chronos / Moirai 2.0）
 
-跨域处理：Structure + MoE (from AnyGraph + Transfer TLP)
-  - domain-agnostic 特征：edge_feat_proj + RoPE time + recency + interaction count
-  - 不用 node ID（domain-specific）
-  - 不用 co-occurrence（二部图失效，见 data_analysis.md）
-  - MoE 路由：不同专家处理不同图类型
+mask 邻居序列中 15% 的 $\Delta t$，预测被 mask 的值。两种 loss 选择：
 
-训练协议：MiNT-style
-  - Order shuffling + Context switching + State reset
-```
+- Chronos 式（量化为 $B$ 个 bin，cross-entropy）：
+
+$$\mathcal{L}_{\text{temporal}} = -\frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \log p_\theta\left(q(\Delta t_i) \mid \Delta t_{\setminus \mathcal{M}}\right)$$
+
+  其中 $q(\cdot)$ 是量化函数，$\mathcal{M}$ 是 mask 集合。
+
+- Moirai 2.0 式（quantile / pinball loss，9 个分位数 $q \in \{0.1, \dots, 0.9\}$）：
+
+$$\mathcal{L}_{\text{temporal}} = \frac{1}{|\mathcal{M}| \cdot |Q|} \sum_{i \in \mathcal{M}} \sum_{q \in Q} \left[ q \cdot \max(\Delta t_i - \hat{\Delta t}_i^{(q)},\, 0) + (1-q) \cdot \max(\hat{\Delta t}_i^{(q)} - \Delta t_i,\, 0) \right]$$
+
+→ 迫使模型理解时序因果结构
+
+**Task 2: Link Prediction**（from AnyGraph / MiNT）
+
+$$\mathcal{L}_{\text{link}} = -\frac{1}{B} \sum_{i=1}^{B} \left[ \log \sigma\left(f_\theta(\mathbf{s}_i, \mathbf{d}_i)\right) + \log \sigma\left(1 - f_\theta(\mathbf{s}_i, \mathbf{n}_i)\right) \right]$$
+
+其中 $\mathbf{s}_i, \mathbf{d}_i, \mathbf{n}_i$ 分别是 src、dst、neg 的表示，$f_\theta$ 是打分函数。→ 主信号，直接对齐 eval，保证 pretrain→eval gap 小
+
+**Task 3: Edge Feature Reconstruction**（from GraphMAE）
+
+mask edge_feat $\mathbf{e}_i$，用 **scaled cosine error** 重建（不用 MSE）：
+
+$$\mathcal{L}_{\text{edge\_feat}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \left(1 - \frac{\hat{\mathbf{e}}_i^\top \mathbf{e}_i}{\|\hat{\mathbf{e}}_i\| \cdot \|\mathbf{e}_i\|}\right)^\gamma, \quad \gamma \geq 1$$
+
+→ 迫使模型理解交互属性；cosine error 对特征范数差异鲁棒
+
+**跨域处理：Structure + MoE**（from AnyGraph + Transfer TLP）
+
+- domain-agnostic 特征：$\text{edge\_feat\_proj}(\mathbf{e}) + \text{RoPE}(\Delta t) + \text{recency} + \text{interaction\_count}$
+- 不用 node ID（domain-specific）
+- 不用 co-occurrence（二部图失效，见 `data_analysis.md`）
+- MoE 路由：router $g_\phi$ 基于图统计特征（密度、重复率、二部性）选择专家：
+
+$$\mathbf{y} = \sum_{k=1}^{K} g_\phi(\mathbf{x})_k \cdot \text{Expert}_k(\mathbf{x}), \quad g_\phi(\mathbf{x}) = \text{TopK}\left(\text{softmax}(W \mathbf{x})\right)$$
+
+**训练协议：MiNT-style**
+
+- Order shuffling：每 epoch shuffle 数据集顺序
+- Context switching：切图时重置模型状态（memory / CSR buffer）
+- State reset：防止跨域状态泄漏
 
 ### 6.5 实现优先级
 

@@ -78,7 +78,7 @@ Input: (src, dst, t, edge_feat) + K neighbors per node
 **依据**：DyG-Mamba (NeurIPS 2025) 的核心创新——Ebbinghaus 遗忘曲线启发，长 Δt 加强遗忘。标准 Mamba 的 A 是固定离散步，不适配事件流不规则间隔。
 
 **实现**：
-- A 参数化：`A(Δt) = exp(-softplus(Δt) · A_base)`
+- A 参数化：$A(\Delta t) = \exp\!\big(-\text{softplus}(\Delta t) \cdot A_{\text{base}}\big)$
 - mamba-ssm 库的 `dt` 参数已支持 input-dependent，传 Δt 即可
 - 额外加 DyG-Mamba 的 "review cycle"（选择性回顾历史关键事件）
 
@@ -90,8 +90,8 @@ Input: (src, dst, t, edge_feat) + K neighbors per node
 
 **实现**：
 - 邻居序列按时间分 patch（每 4 个邻居一个 patch）
-- 因果 Mamba 预测 next patch 的邻居 ID 分布（softmax over node vocab）
-- 预训练 loss = next-neighbor-patch CE + 链接预测 BCE（多任务）
+- 因果 Mamba 预测 next patch 的邻居 ID 分布（$\text{softmax}$ over node vocab）
+- 预训练 loss：$\mathcal{L} = \mathcal{L}_{\text{next-patch CE}} + \mathcal{L}_{\text{link BCE}}$（多任务）
 
 **改动**：新增 `pretraining objective` 模式，engine 支持，~150 行。
 
