@@ -56,53 +56,72 @@
 
 **这解释了为什么三任务混合时 LP loss 大幅下降而 MTM/NTP 几乎不动**——不是 LP 挤压自监督，而是自监督本身没学到东西，模型只能靠 LP。
 
-## 实验 C：with node embedding
+## 实验 E：纯 LP（无 MTM/NTP），无 node emb
 
-**假设**：无 node embedding 导致 in-domain eval 吃亏。加回 node emb 应该提升 in-domain AP。
+**假设**：MTM/NTP 是噪声，去掉应该提升（LP 是唯一有效信号）。
 
 **结果**：
 
-| 数据集 | baseline (无 node emb) | C_nodeemb (有 node emb) | Δ |
-|--------|----------------------|------------------------|---|
-| enron | 0.7038 | **0.7834** | +0.08 ✅ |
-| BitcoinAlpha | 0.7808 | 0.6508 | -0.13 ❌ |
-| uci | 0.8128 | 0.7275 | -0.09 ❌ |
+| 数据集 | baseline (三任务) | E_lponly (纯LP) | Δ |
+|--------|------------------|----------------|---|
+| enron | 0.7038 | 0.6567 | -0.05 ❌ |
+| BitcoinAlpha | 0.7808 | 0.8081 | +0.03 ✅ |
+| uci | 0.8128 | 0.7988 | -0.01 |
 
-**结论**：node embedding 对 enron（极稠密小图）帮助大，但对 BA/uci 反而有害。
+**结论**：MTM/NTP 对 enron/uci 有帮助，对 BA 是噪声。自监督任务的作用因域而异。
 
-**insight**：node embedding 记住具体节点，in-domain 受益，但损害跨域。enron 只有 185 节点，node emb 能有效记忆每个节点的交互模式；BA/uci 节点多（3784/1900），node emb 容易过拟合训练集。
+## 实验 D：纯 LP + node emb
 
-## 完整对比与归因结论
+**假设**：Foundation + node emb + 纯 LP 应该接近 Phase 1 的 0.876。
 
-| 实验 | enron | BA | uci | avg |
-|------|-------|-----|-----|-----|
-| baseline | 0.704 | 0.781 | 0.813 | 0.766 |
-| A_prop (按比例) | 0.702 | 0.680 | 0.838 | 0.740 |
-| B_noss (纯自监督) | 0.506 | 0.519 | 0.531 | 0.519 |
-| C_nodeemb | 0.783 | 0.651 | 0.728 | 0.721 |
+**结果**：enron=0.787（vs Phase 1 的 0.876，差 0.09）
 
-### 归因结论（修正原假设）
+## 最终归因（enron 0.876 → 0.704）
 
-**原假设全部被推翻，真正原因是：**
+| 因素 | enron AP | 损失 |
+|------|---------|------|
+| Phase 1 _MiniMamba (node emb + 纯LP) | 0.876 | 基准 |
+| D_lponly_nodeemb (Foundation + node emb + 纯LP) | 0.787 | -0.09（架构差异）|
+| baseline (Foundation 无 node emb + 三任务) | 0.704 | -0.17（去 node emb）|
 
-1. **enron 差的真正原因：K=32 对极稠密图严重不足**（不是数据 cap）
-   - enron avg degree 1157，K=32 只能看到 32 个邻居，丢失 97% 邻居信息
-   - 证据：A_prop 给 3x 数据没用（0.702），C_nodeemb 加 node emb 才有效（0.783）
-   - 解法：对稠密图用更大 K（如 K=256），或用 attention pooling 代替 last-pool
+**enron 差的真正原因**：
+1. **去 node embedding 损失 0.08-0.09**（主因）——Foundation 的 domain-agnostic 特征无法替代 node emb 对 enron 的作用
+2. **Foundation 架构 vs _MiniMamba 差 0.09**——InputTokenizer 的结构特征（recent_degree/PA/Δt-stats）不如 _MiniMamba 的简单 node emb 对 enron 有效
+3. **MTM/NTP 自监督对 enron 几乎无影响**（0.787 vs 0.783）
 
-2. **自监督任务设计有根本缺陷**（不是 LP dominate）
-   - B_noss 证明去掉 LP 后 MTM/NTP 完全失效（~0.52 随机）
-   - MTM 重建 edge_feat+pair_feat ≠ 学到链接预测相关表示
-   - NTP 预测时间 ≠ 链接预测能力
-   - 解法：重新设计 MTM/NTP 目标，或参考 TGPM 的 interaction patch
+## 完整对比表
 
-3. **node embedding 是 in-domain/跨域 trade-off**
-   - C_nodeemb 让 enron +0.08 但 BA/uci -0.09~-0.13
-   - 验证"去 node ID"方向正确，但需要更强的 domain-agnostic 特征
+| 实验 | 配置 | enron | BA | uci |
+|------|------|-------|-----|-----|
+| baseline | 三任务, 无 node emb | 0.704 | 0.781 | 0.813 |
+| A_prop | 按比例采样 | 0.702 | 0.680 | 0.838 |
+| B_noss | 纯自监督(无LP) | 0.506 | 0.519 | 0.531 |
+| C_nodeemb | 三任务+node emb | 0.783 | 0.651 | 0.728 |
+| E_lponly | 纯LP, 无node emb | 0.657 | 0.808 | 0.799 |
+| D_lponly_nodeemb | 纯LP+node emb | 0.787 | 0.683 | 0.672 |
+| (Phase 1 ref) | _MiniMamba, node emb, 纯LP | 0.876 | 0.618 | 0.698 |
 
-### 下一步方向
+## 核心结论
 
-1. **增大 K**：对稠密图（enron）用 K=128 或 256，验证是否解决信息丢失
-2. **重新设计自监督任务**：MTM 目标改为重建更有链接预测相关性的特征，或换 TGPM 的 interaction patch tokenization
-3. **用 zero-shot eval**：当前 in-domain eval 无法体现跨域迁移价值，改 leave-one-out
-4. **调 loss 权重**：既然 LP 是主信号，可降 MTM/NTP 权重避免噪声干扰
+### 1. 原假设全部推翻，真正原因是 node emb 缺失 + 架构差异
+
+- ❌ 数据 cap（A_prop 推翻）
+- ❌ LP dominate（B_noss 推翻）
+- ❌ K 太小（K=32/64/128/256 enron 都 0.69-0.70）
+- ✅ **去 node emb 是主因**（损失 0.08-0.09）
+- ✅ **Foundation 架构不如 _MiniMamba**（差 0.09）
+
+### 2. 没有单一配置对所有域最优——验证 MoE 必要性
+
+- enron：需要 node emb（D=0.787 > baseline=0.704）
+- BA：不需要 node emb，纯 LP 最佳（E=0.808）
+- uci：三任务无 node emb 最佳（baseline=0.813）
+
+这正好说明 OOD 综述推荐的 **MoE**（不同域用不同专家/特征）是正确方向。
+
+### 3. 自监督任务设计需改进
+
+- B_noss 证明去掉 LP 后 MTM/NTP 完全失效
+- 但 E_lponly 证明去掉 MTM/NTP 后 enron 也降
+- 说明 MTM/NTP 有微弱正面作用，但远不如 LP
+- 需要更强的自监督目标（参考 TGPM interaction patch）

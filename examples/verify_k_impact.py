@@ -1,12 +1,15 @@
-"""Verify attribution hypotheses for poor pretraining results.
+"""Verify K (neighbor sequence length) impact on dense graphs.
 
-3 controlled experiments (small model d=128, K=32, 10 epoch for speed):
-  A: proportional mixing (no cap) — tests data-cap hypothesis
-  B: pure self-supervised (MTM+NTP, no LP) — tests LP-dominate hypothesis
-  C: with node embedding — tests no-node-emb hypothesis
+Hypothesis: enron (avg degree 1157) performs poorly because K=32 only
+captures 2.7% of neighbors. Increasing K should improve enron.
 
-Baseline (from previous run): balanced mix, no node emb, 3 tasks
-  enron=0.711, BA=0.732, uci=0.777
+Experiments (d=128, 10 epoch, 3-task, balanced):
+  baseline K=32:  enron=0.704, BA=0.781, uci=0.813
+  D1 K=64:        ?
+  D2 K=128:       ?
+  D3 K=256:       ?
+
+If enron AP rises with K (and others stay stable), confirms K too small.
 """
 import argparse
 import sys
@@ -24,15 +27,12 @@ def main():
     p.add_argument("--data_root", default="/mnt/home/gyq/CodeBase/Graph/DG_Data")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=200)
-    p.add_argument("--K", type=int, default=32)
+    p.add_argument("--K", type=int, default=64)
     p.add_argument("--d_model", type=int, default=128)
     p.add_argument("--d_state", type=int, default=16)
     p.add_argument("--n_mamba_layers", type=int, default=4)
     p.add_argument("--gca_every", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--experiment", choices=["baseline", "A_prop", "B_noss", "C_nodeemb",
-                                            "D_lponly_nodeemb", "E_lponly"],
-                   required=True)
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
@@ -45,40 +45,13 @@ def main():
 
     seed_everything(42)
 
-    # --- Load datasets ---
     ds_list = [load_dataset(n, args.data_root) for n in args.datasets]
     mixed = MixedDataset(ds_list, names=args.datasets)
-    print(f"Experiment: {args.experiment}", flush=True)
+    print(f"K={args.K}", flush=True)
     print(mixed.summary(), flush=True)
 
-    # --- Build graph ---
     graph = mixed.make_graph(buffer_size=args.K, device=args.device)
 
-    # --- Experiment-specific config ---
-    pretrain_mode = True
-    task_weights = {"mtm": 1.0, "ntp": 1.0, "lp": 1.0}
-    mix_mode = "balanced"
-    use_node_emb = False
-
-    if args.experiment == "A_prop":
-        # Proportional mixing (no cap)
-        mix_mode = "proportional"
-    elif args.experiment == "B_noss":
-        # Pure self-supervised: disable LP
-        task_weights = {"mtm": 1.0, "ntp": 1.0, "lp": 0.0}
-    elif args.experiment == "C_nodeemb":
-        # Add node embedding back
-        use_node_emb = True
-    elif args.experiment == "D_lponly_nodeemb":
-        # LP only (no MTM/NTP) + node emb — isolate node emb benefit without
-        # self-supervised noise. Compare to Phase 1 baseline (0.876 enron).
-        use_node_emb = True
-        task_weights = {"mtm": 0.0, "ntp": 0.0, "lp": 1.0}
-    elif args.experiment == "E_lponly":
-        # LP only (no MTM/NTP), no node emb — isolate self-supervised noise
-        task_weights = {"mtm": 0.0, "ntp": 0.0, "lp": 1.0}
-
-    # --- Build model ---
     model = FoundationModel(
         d_edge=mixed.d_edge,
         d_model=args.d_model,
@@ -87,40 +60,21 @@ def main():
         d_time=32,
         n_mamba_layers=args.n_mamba_layers,
         gca_every=args.gca_every,
-        pretrain_mode=pretrain_mode,
-        task_weights=task_weights,
+        pretrain_mode=True,
+        task_weights={"mtm": 1.0, "ntp": 1.0, "lp": 1.0},
     ).to(args.device)
     model.init_ema(momentum=0.999)
 
-    # Add node embedding if requested
-    if use_node_emb:
-        model.node_emb = torch.nn.Embedding(mixed.num_nodes, args.d_model).to(args.device)
-        # Hook into encode_one to add node_emb
-        orig_encode_one = model.encode_one
-        def encode_one_with_nodeemb(nbr, query_time, mtm_mask=None, ntp_mask_pos0=False):
-            h, st = orig_encode_one(nbr, query_time, mtm_mask, ntp_mask_pos0)
-            # Add source node embedding (from neighbor_ids[:, 0] = most recent)
-            # Actually we need the query node's own ID, which isn't in NeighborData.
-            # Use mean of neighbor embeddings as proxy.
-            ids = nbr.neighbor_ids.long().clamp(min=0)
-            nbr_emb = model.node_emb(ids).mean(dim=1)  # (B, d_model)
-            h = h + nbr_emb.unsqueeze(1)  # broadcast to (B, K, d_model)
-            return h, st
-        model.encode_one = encode_one_with_nodeemb
-
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {n_params:,} params  mix={mix_mode}  weights={task_weights}  "
-          f"node_emb={use_node_emb}", flush=True)
+    print(f"Model: {n_params:,} params  K={args.K}", flush=True)
 
-    # --- Batches ---
     train_batches = mixed.get_batches(
-        "train", batch_size=args.batch_size, balance=True, mode=mix_mode, device=args.device,
+        "train", batch_size=args.batch_size, balance=True, mode="balanced", device=args.device,
     )
     val_batches = mixed.get_batches("val", batch_size=args.batch_size, device=args.device)
     test_batches = mixed.get_batches("test", batch_size=args.batch_size, device=args.device)
     print(f"Batches: train={len(train_batches)} val={len(val_batches)}", flush=True)
 
-    # --- Engine ---
     neg = RandomNegative(mixed.num_nodes)
     cfg = TrainConfig(
         epochs=args.epochs, lr=args.lr, device=args.device,
@@ -132,14 +86,11 @@ def main():
         neg_strategy=neg, eval_protocol=APEval(), config=cfg,
     )
 
-    # --- Train ---
     t0 = time.time()
     result = engine.train()
     dt = time.time() - t0
-    print(f"\n=== {args.experiment} complete in {dt:.1f}s ===", flush=True)
-    print(f"  merged test AP: {result}", flush=True)
+    print(f"\n=== K={args.K} complete in {dt:.1f}s ===", flush=True)
 
-    # --- Per-domain eval ---
     print(f"\n  Per-domain eval:", flush=True)
     for info, ds in zip(mixed._infos, ds_list):
         ap = eval_on_domain(model, ds, info, args)
@@ -147,11 +98,12 @@ def main():
 
 
 def eval_on_domain(model, ds, info, args):
-    """Per-domain eval with in-domain negatives + normalized timestamps."""
     from tgengine.core.temporal_graph import TemporalGraph
     from tgengine.core.batch import RawBatch
     from tgengine.pipeline import DataPipeline
     from tgengine.pipeline.negatives import RandomNegative
+    import numpy as np
+    from sklearn.metrics import average_precision_score
 
     offset = info.node_offset
     total_nodes = offset + info.num_nodes
@@ -161,7 +113,6 @@ def eval_on_domain(model, ds, info, args):
     )
     domain_neg = RandomNegative(info.num_nodes)
 
-    # Normalize timestamps (same as MixedDataset)
     t_all = ds.time.cpu().float()
     t_min, t_max = float(t_all.min()), float(t_all.max())
     t_norm = ((t_all - t_min) / (t_max - t_min) if t_max > t_min
@@ -195,8 +146,6 @@ def eval_on_domain(model, ds, info, args):
         prepped.append(eval_pipeline.prepare(rb))
 
     model.eval()
-    import numpy as np
-    from sklearn.metrics import average_precision_score
     with torch.no_grad():
         all_pos, all_neg = [], []
         for batch in prepped:
