@@ -26,7 +26,7 @@
 
 动态图输入是**两条信息流**，不能简化为单一序列：
 - **时序流**：事件序列 + 不规则时间间隔（burst、周期、趋势）
-- **图结构流**：邻居拓扑、degree/centrality/community（**不用 co-occurrence**——二部图失效，见数据分析）
+- **图结构流**：**时序**结构特征（recent degree / PA / Δt 统计），**不用静态全局 centrality/community**（K 邻居 buffer 算不出来），**不用 co-occurrence**（二部图失效）
 
 模型要让两条流**深度交互**，不是简单拼接。时序流走 Mamba SSM 主干（线性复杂度适合长序列），图结构流通过 cross-attention 调制时序状态。
 
@@ -47,17 +47,18 @@
 Input: (src, dst, t, edge_feat) + K neighbors per node
   │
   ├── 时序流（domain-agnostic token）
-  │   edge_feat proj + 结构特征(degree/centrality/community) → token
+  │   edge_feat proj + 时序结构特征(recent_degree/PA/Δt-stats/novelty) → token
   │   time-RoPE(Δt) 注入 token
   │   → Mamba block ×4  (A(Δt) 时间感知 SSM)
   │
   ├── 图结构流
-  │   结构特征: degree rank + centrality + community membership
+  │   时序结构特征: recent_degree + preferential_attachment + Δt 统计
+  │   （不用静态 centrality/community——K 邻居算不出来）
   │   （不用 co-occurrence——二部图 AUC=0.5）
   │
   ├── Graph Cross-Attention
   │   Q = Mamba hidden state (时序)
-  │   K,V = 结构特征 tokens (图结构)
+  │   K,V = 时序结构特征 tokens (图结构)
   │   → 调制后的 hidden state
   │
   ├── Mamba block ×4  (继续时序建模，已融合图信息)
@@ -66,10 +67,9 @@ Input: (src, dst, t, edge_feat) + K neighbors per node
   │
   ├── MoE 路由: router 基于图统计(密度/重复率/二部性)选专家
   │
-  └── 预训练头 (多任务)
-      Task 1: Link Prediction BCE
-      Task 2: Masked Token Modeling (block-wise, EMA target)
-      Task 3: Next Time Prediction (预测时间编码向量)
+  └── 预训练头 (分阶段)
+      Phase 2a: MTM (block-wise, EMA) + NTP (纯自监督)
+      Phase 2b: + Link Prediction BCE (对齐 eval)
 ```
 
 ## 三个核心技术（落地细节）
@@ -100,18 +100,21 @@ Input: (src, dst, t, edge_feat) + K neighbors per node
 
 **依据**：TGPM (ICML 2026) 证明 MTM + NTP 双任务在 CTDG 跨域迁移上大幅领先（average rank 1.0）。NTP 直接解决"回顾性时间建模"缺陷，对齐 Hawkes 过程。GraphMAE (KDD 2022) 的 scaled cosine error 比 MSE 稳定。
 
-**总损失函数**：
+**BCE 的 trade-off**（TGPM vs 主流 CTDG）：
+- TGPM 是**纯自监督**（MTM+NTP），刻意不用 LP BCE——认为任务监督会"过拟合短期相关性，阻碍可迁移模式"
+- 但 MiNT (NeurIPS 2025) / DDGPrompt (CIKM 2025) 用标准 LP BCE 预训练也成功实现跨域迁移
+- **我们的决策**：参考 LLM pretrain→finetune 范式，**分阶段**——先纯自监督学通用模式，再加 BCE 对齐 eval。避免 BCE 从一开始就主导表示学习。
 
-$$\mathcal{L}_{\text{total}} = \alpha \cdot \mathcal{L}_{\text{link}} + \beta \cdot \mathcal{L}_{\text{MTM}} + \gamma \cdot \mathcal{L}_{\text{NTP}}$$
+**三个任务的 loss**：
 
-#### Task 1: Link Prediction BCE（主信号，直接对齐 eval）
+#### Task 1: Link Prediction BCE（主信号，直接对齐 eval，Phase 2b 加入）
 
 $$\mathcal{L}_{\text{link}} = -\frac{1}{B} \sum_{i=1}^{B} \left[ \log \sigma\!\big(f_\theta(\mathbf{s}_i, \mathbf{d}_i)\big) + \log \sigma\!\big(1 - f_\theta(\mathbf{s}_i, \mathbf{n}_i)\big) \right]$$
 
 - $\mathbf{s}_i, \mathbf{d}_i, \mathbf{n}_i$ 分别是 src、dst、neg 的表示
-- DDGPrompt (CIKM 2025) 验证标准 LP 预训练是 CTDG 领域默认做法
+- 强二元监督信号，但可能偏向 LP 任务——故放在自监督之后
 
-#### Task 2: Masked Token Modeling — 学"什么演化"（来自 TGPM）
+#### Task 2: Masked Token Modeling — 学"什么演化"（来自 TGPM，Phase 2a）
 
 **Block-wise masking**（不是随机单 token）——block size $b$ 控制模型被迫推理的最小时间跨度：
 
@@ -122,7 +125,7 @@ $$\mathcal{L}_{\text{MTM}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \l
 - $\mathbf{r}_i$ 为 SimMIM 式重建输出
 - **关键**：block size 是多尺度时间依赖的超参——TGPM 证明这是信息论必要条件
 
-#### Task 3: Next Time Prediction — 学"何时演化"（来自 TGPM，**我们原方案缺失**）
+#### Task 3: Next Time Prediction — 学"何时演化"（来自 TGPM，Phase 2a）
 
 $$\mathcal{L}_{\text{NTP}} = \frac{1}{m-1} \sum_{i=1}^{m-1} \left\| f_{\text{NTP}}(\mathbf{p}'_i) - \mathbf{t}_{i+1} \right\|$$
 
@@ -132,20 +135,48 @@ $$\mathcal{L}_{\text{NTP}} = \frac{1}{m-1} \sum_{i=1}^{m-1} \left\| f_{\text{NTP
 - 自回归分解：$p(\mathbf{t}_1, \dots, \mathbf{t}_m) = \prod_{i=1}^m p(\mathbf{t}_i \mid \mathbf{t}_{<i}, \bar{\mathbf{p}}_{<i})$
 - **为什么重要**：迫使模型编码演化时间粒度（典型间隔）+ 频率信号（交互频率），把不同演化模式关联到不同时间节奏。直接对齐 Hawkes 强度函数。
 
-**改动**：新增 `pretraining` 模块，engine 支持三任务联合训练，~200 行。
+**分阶段 loss 调度**：
+- Phase 2a（纯自监督）：$\mathcal{L} = \beta \cdot \mathcal{L}_{\text{MTM}} + \gamma \cdot \mathcal{L}_{\text{NTP}}$（学通用模式）
+- Phase 2b（加 BCE）：$\mathcal{L} = \alpha \cdot \mathcal{L}_{\text{link}} + \beta \cdot \mathcal{L}_{\text{MTM}} + \gamma \cdot \mathcal{L}_{\text{NTP}}$（对齐 eval）
+
+**改动**：新增 `pretraining` 模块，engine 支持三任务联合 + 分阶段调度，~200 行。
 
 ## 跨域处理：Structure + MoE（来自 OOD 综述 + AnyGraph + Scalable LP）
 
 ### Domain-agnostic 输入特征（不用 node ID）
 
-Universal GFM (Stanford, 2026) 验证：用 feature-agnostic 结构属性作 prompts，不同图嵌入共享空间。我们用：
+**关键约束**：我们的 K 邻居 ring buffer 只存最近 K 个交互，**没有全图拓扑**。因此：
+- ❌ 全局 centrality / community 算不出来（Universal GFM 的静态特征不适用 CTDG）
+- ❌ co-occurrence 在二部图上恒为 0（数据分析 AUC=0.5）
+- ✅ 只用 **时序局部**结构特征——从 K 邻居 buffer 在 query time $t$ 现算
 
-$$\text{token} = \text{edge\_feat\_proj}(\mathbf{e}) + \text{RoPE}(\Delta t) + \text{struct\_proj}(\text{degree}, \text{centrality}, \text{community}) + \text{recency}$$
+**单节点时序特征**（从 src/dst 自己的 K 邻居 buffer）：
+
+| 特征 | 计算 | 含义 |
+|------|------|------|
+| `recent_degree` | `mask.sum(dim=1)` | 时序度（≤K），近期活跃度 |
+| `activity_rate` | `recent_degree / (t - t_oldest)` | 单位时间交互率 |
+| `Δt_mean / Δt_var` | `diff(timestamps)` 统计 | 时序规律性 / 突发性 |
+| `novelty_ratio` | `unique(neighbor_ids) / recent_degree` | 新邻居占比 |
+| `recency_last` | `t - timestamps[newest]` | 距上次交互时间 |
+
+**配对时序特征**（src-dst 之间，二部图同构图都有效）：
+
+| 特征 | 计算 | 二部图有效 |
+|------|------|-----------|
+| `pair_history_count` | dst 在 src 邻居 buffer 出现次数 | ✅ |
+| `pair_recency` | 距上次 src-dst 交互时间 | ✅ |
+| `preferential_attachment` | `recent_degree(src) × recent_degree(dst)` | ✅ **关键** |
+| `co_neighbor_count` | 共同邻居（已有 CUDA kernel）| ❌ 二部图恒 0 |
+
+**输入 token**：
+
+$$\text{token} = \text{edge\_feat\_proj}(\mathbf{e}) + \text{RoPE}(\Delta t) + \text{struct\_proj}(\text{recent\_degree}, \text{PA}, \Delta t\text{-stats}, \text{novelty}, \text{recency})$$
 
 - **不用 node ID**（domain-specific，跨域不迁移）
-- **不用 co-occurrence**（数据分析显示二部图 AUC=0.5，失效）
-- 用 degree rank / centrality / community membership（Universal GFM 验证鲁棒）
-- recency（上次交互时间差）+ interaction count（重复交互次数）
+- **不用静态全局 centrality/community**（K 邻居算不出来）
+- **不用 co-occurrence**（二部图失效）
+- `preferential_attachment` 是二部图+同构图通用的关键 LP 启发式，$O(1)$ 可算
 
 ### MoE 路由（处理域层 negative transfer）
 
@@ -188,11 +219,14 @@ TGPM 实验发现：**高突发性数据集预训练收益小甚至有害**。
 
 | 阶段 | 数据 | 目标 | 硬件 |
 |------|------|------|------|
-| 预训练 Phase 1 | 2-3 低突发性数据集混合 | 纯 link prediction BCE + MiNT 协议 | 4×3090 DDP |
-| 预训练 Phase 2 | + 加 MTM (block-wise) + NTP | 三任务联合 loss | 4×3090 DDP |
+| 预训练 Phase 1 | 2-3 低突发性数据集混合 | 纯 link prediction BCE + MiNT 协议（baseline，验证多域训练有效） | 4×3090 DDP |
+| 预训练 Phase 2a | 同上 | 纯自监督 MTM + NTP（TGPM 路线，学通用模式） | 4×3090 DDP |
+| 预训练 Phase 2b | 同上 | Phase 2a checkpoint + 加 LP BCE 微调（对齐 eval） | 4×3090 DDP |
 | 预训练 Phase 3 | + MoE 路由 + 全数据集 | 完整方案 | 4×3090 DDP |
 | 评估 | zero-shot 迁移到未见域 | AP / MRR / Hits@K | 单卡 |
 | 微调 | few-shot 适配目标域（冻结 expert，只学 router） | 下游任务指标 | 单卡 |
+
+**Phase 1 vs Phase 2a 对比**：验证 TGPM 的核心论断——纯自监督（2a）是否比纯 BCE（1）跨域迁移更好。
 
 ## 与框架的协同
 
