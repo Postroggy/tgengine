@@ -148,6 +148,10 @@ def eval_on_domain(model, ds, info, args):
 
     Negatives sampled from THIS domain's node range only (offset, offset+num_nodes)
     so cross-domain "easy negatives" don't inflate AP.
+
+    IMPORTANT: timestamps are normalized to [0,1] the same way MixedDataset does,
+    because the model was trained on normalized timestamps. Using original
+    timestamps would break the time encoding (Δt scale mismatch).
     """
     from tgengine.core.temporal_graph import TemporalGraph
     from tgengine.core.batch import RawBatch
@@ -165,25 +169,41 @@ def eval_on_domain(model, ds, info, args):
     # Negatives: sample within this domain then add offset
     neg = RandomNegative(info.num_nodes)
 
-    # Load all splits of this domain into eval graph (remapped to mixed ID space)
-    for split in ["train", "val", "test"]:
-        batches = ds.get_batches(split, batch_size=args.batch_size, device=args.device)
-        for rb in batches:
-            eval_graph.advance(rb.src + offset, rb.dst + offset,
-                               rb.time, rb.edge_feat)
+    # Normalize timestamps to [0,1] (same as MixedDataset)
+    t_all = ds.time.cpu().float()
+    t_min, t_max = float(t_all.min()), float(t_all.max())
+    t_norm = (t_all - t_min) / (t_max - t_min) if t_max > t_min else torch.zeros_like(t_all)
+    t_norm = t_norm.to(args.device)
+
+    # Determine split boundaries (same as MixedDataset: 70/15/15)
+    n = len(t_norm)
+    train_end = int(n * 0.70)
+    val_end = int(n * 0.85)
+
+    # Load all splits into eval graph (remapped to mixed ID space + normalized time)
+    src_all = ds.src.to(args.device) + offset
+    dst_all = ds.dst.to(args.device) + offset
+    feat_all = ds.edge_feat.to(args.device) if ds.edge_feat is not None else None
+    # Load train+val+test edges for eval graph (DyGLib protocol: full neighbor)
+    eval_graph.advance(src_all, dst_all, t_norm, feat_all)
     eval_graph.freeze_csr()
 
     pipeline = DataPipeline(model.gather_spec, eval_graph)
 
     # Val batches with per-domain neg (sampled in [0, num_nodes) then +offset)
-    val_batches = ds.get_batches("val", batch_size=args.batch_size, device=args.device)
+    val_src = src_all[train_end:val_end]
+    val_dst = dst_all[train_end:val_end]
+    val_t = t_norm[train_end:val_end]
+    val_feat = feat_all[train_end:val_end] if feat_all is not None else None
+
     prepped = []
-    for rb in val_batches:
-        n = neg.sample(rb.src, rb.dst, rb.time, eval_graph, rb.edge_indices) + offset
-        prepped.append(RawBatch(
-            src=rb.src + offset, dst=rb.dst + offset, time=rb.time,
-            edge_feat=rb.edge_feat, neg=n, edge_indices=rb.edge_indices,
-        ))
+    bs = args.batch_size
+    for i in range(0, len(val_src), bs):
+        s = slice(i, i + bs)
+        src_b, dst_b, t_b = val_src[s], val_dst[s], val_t[s]
+        feat_b = val_feat[s] if val_feat is not None else None
+        n_b = neg.sample(src_b - offset, dst_b - offset, t_b, eval_graph, None) + offset
+        prepped.append(RawBatch(src=src_b, dst=dst_b, time=t_b, edge_feat=feat_b, neg=n_b))
 
     model.eval()
     protocol = APEval()
