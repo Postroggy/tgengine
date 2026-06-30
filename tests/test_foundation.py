@@ -7,6 +7,7 @@ Tests cover:
 """
 import pytest
 import torch
+import torch.nn as nn
 
 from tgengine.core.batch import NeighborData, PreparedBatch
 from tgengine.models.foundation import FoundationModel
@@ -49,7 +50,7 @@ def _make_neighbor_data(B, K, num_nodes=100, d_edge=8, device="cuda"):
 
 def test_trainable_sinusoidal_time_encoding():
     """Time encoding produces correct shape and is differentiable."""
-    enc = TrainableSinusoidalTimeEncoding(d_time=16)
+    enc = TrainableSinusoidalTimeEncoding(d_time=16).cuda()
     dt = torch.rand(4, 8, device="cuda")
     out = enc(dt)
     assert out.shape == (4, 8, 16)
